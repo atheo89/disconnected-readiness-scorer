@@ -334,6 +334,49 @@ class TestFileLevelAwareness:
         for finding in yaml_findings:
             assert finding.severity == "warning"
 
+    def test_file_var_in_manifest_stays_info(self, tmp_path):
+        """Nearby var that IS in manifest -> info (trusted coverage)."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "images.go").write_text(
+            'os.Getenv("RELATED_IMAGE_FOO")\n'
+            'image: quay.io/org/fallback:v1\n'
+        )
+        manifest = {"RELATED_IMAGE_FOO"}
+        result = check_env_var_pattern(tmp_path, manifest_env_vars=manifest)
+        img_findings = [f for f in result.findings
+                        if f.image == "quay.io/org/fallback:v1"]
+        assert len(img_findings) == 1
+        assert img_findings[0].severity == "info"
+
+    def test_file_var_not_in_manifest_escalates(self, tmp_path):
+        """Nearby var NOT in manifest -> warning (not trusted)."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "images.go").write_text(
+            'os.Getenv("RELATED_IMAGE_FOO")\n'
+            'image: quay.io/org/fallback:v1\n'
+        )
+        manifest = {"RELATED_IMAGE_BAR"}
+        result = check_env_var_pattern(tmp_path, manifest_env_vars=manifest)
+        img_findings = [f for f in result.findings
+                        if f.image == "quay.io/org/fallback:v1"]
+        assert len(img_findings) == 1
+        assert img_findings[0].severity == "warning"
+
+    def test_sibling_var_not_in_manifest_escalates(self, tmp_path):
+        """Sibling dir var NOT in manifest -> warning."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "envvars.go").write_text('os.Getenv("RELATED_IMAGE_FOO")')
+        (pkg / "defaults.go").write_text('image: quay.io/org/img:v1')
+        manifest = {"RELATED_IMAGE_OTHER"}
+        result = check_env_var_pattern(tmp_path, manifest_env_vars=manifest)
+        img_findings = [f for f in result.findings
+                        if f.image == "quay.io/org/img:v1"]
+        assert len(img_findings) == 1
+        assert img_findings[0].severity == "warning"
+
 
 class TestCheckEnvVarPattern:
     def _make_env_var_repo(self, tmp_path, go_content, yaml_content=None):

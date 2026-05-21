@@ -291,26 +291,20 @@ def check_env_var_pattern(
             )
 
             relative = str(filepath.relative_to(repo_root))
-            if file_vars:
+            nearby_vars = file_vars or (dir_vars if filepath.suffix == ".go" else set())
+            if manifest_env_vars is not None and nearby_vars:
+                nearby_vars = nearby_vars & manifest_env_vars
+            nearby_source = "file" if file_vars else "sibling"
+
+            if nearby_vars:
                 result.findings.append(Finding(
                     severity="info",
                     file=relative,
                     line=line_num,
                     image=image,
                     message=f"Image '{image}' has no same-line RELATED_IMAGE_* mapping, "
-                            f"but file contains {', '.join(sorted(file_vars))}. "
+                            f"but {nearby_source} contains {', '.join(sorted(nearby_vars))}. "
                             f"Likely covered by env var injection.",
-                ))
-            elif dir_vars and filepath.suffix == ".go":
-                result.findings.append(Finding(
-                    severity="info",
-                    file=relative,
-                    line=line_num,
-                    image=image,
-                    message=f"Image '{image}' has no same-line RELATED_IMAGE_* mapping, "
-                            f"but sibling files in same package reference "
-                            f"{', '.join(sorted(dir_vars))}. "
-                            f"Likely a fallback/default for env var injection.",
                 ))
             else:
                 severity = "info" if excluded else "warning"
