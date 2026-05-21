@@ -1,3 +1,14 @@
+---
+name: disconnected-score
+description: >
+  Score a repository's readiness for disconnected / air-gapped OpenShift deployments.
+  Scans for image manifest completeness, digest enforcement, runtime egress, and
+  Python dependency validation. Use when asked to check disconnected readiness,
+  air-gap compliance, or image mirroring coverage for an RHOAI component repo.
+user-invocable: true
+allowed-tools: Read, Bash, Glob, Grep
+---
+
 # disconnected-readiness-scorer
 
 Score a repository's readiness for deployment in disconnected / air-gapped OpenShift environments.

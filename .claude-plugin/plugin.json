@@ -1,0 +1,18 @@
+{
+  "name": "disconnected-readiness-scorer",
+  "version": "0.1.0",
+  "description": "Score a repository's readiness for disconnected / air-gapped OpenShift deployments",
+  "author": {
+    "name": "opendatahub-io"
+  },
+  "homepage": "https://github.com/opendatahub-io/disconnected-readiness-scorer",
+  "repository": "https://github.com/opendatahub-io/disconnected-readiness-scorer",
+  "license": "Apache-2.0",
+  "keywords": [
+    "disconnected",
+    "air-gap",
+    "openshift",
+    "image-mirroring",
+    "readiness"
+  ]
+}
