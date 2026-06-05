@@ -52,7 +52,7 @@ RULE_REGISTRY = {
     },
 }
 
-DEFAULT_RULES = list(RULE_REGISTRY.keys())
+DEFAULT_RULES = [k for k, v in RULE_REGISTRY.items() if not v.get("is_manifest_rule")]
 
 
 def _parse_exceptions_fallback(text):

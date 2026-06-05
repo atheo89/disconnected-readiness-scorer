@@ -38,6 +38,9 @@ def retry_github_operation(func, max_retries=MAX_RETRIES):
     for attempt in range(max_retries):
         try:
             return func()
+        except (KeyboardInterrupt, SystemExit):
+            # Don't retry on cancellation signals
+            raise
         except Exception as e:
             if attempt == max_retries - 1:  # Last attempt
                 raise e

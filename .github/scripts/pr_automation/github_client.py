@@ -65,7 +65,7 @@ class GitHubClient:
                 status_message=status_message
             )
 
-        except Exception as e:
+        except (OSError, IOError, ValueError, AttributeError) as e:
             return RateLimitStatus(
                 is_safe=False,
                 remaining=0,

@@ -11,6 +11,8 @@ from typing import Tuple, List
 from dataclasses import dataclass
 import io
 
+from github import UnknownObjectException, GithubException
+
 from .utils import retry_github_operation, READY_FOR_WORKFLOW, ALREADY_HAS_WORKFLOW, ARCHIVED_REPOSITORY
 from .config import AutomationConfig
 
@@ -38,8 +40,8 @@ class WorkflowDetector:
         try:
             repo.get_contents('.github/workflows/disconnected-readiness.yml')
             return True, "Workflow file exists"
-        except:
-            pass
+        except UnknownObjectException:
+            pass  # File doesn't exist, continue to check for pending PRs
 
         # Check for specific fixed branch names instead of patterns
         fixed_branches = ['drs-workflow-add', 'drs-workflow-update', 'drs-template-update']
@@ -56,8 +58,12 @@ class WorkflowDetector:
                 if open_prs:
                     pr = open_prs[0]
                     return True, f"Open PR already exists: #{pr.number} - {pr.title}"
-            except:
+            except UnknownObjectException:
                 continue  # Branch doesn't exist, try next one
+            except GithubException as e:
+                # API error (permission, rate limit, etc.) - log and continue
+                print(f"    Warning: Error checking branch '{branch_name}': {e}")
+                continue
 
         return False, "No workflow found"
 

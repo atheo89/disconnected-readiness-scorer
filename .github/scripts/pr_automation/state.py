@@ -33,7 +33,7 @@ class StateManager:
             yaml = YAML(typ='safe', pure=True)  # Equivalent to yaml.safe_load
             with open(self.state_file, 'r') as f:
                 return yaml.load(f) or {'organizations': {}, 'template_state': {}}
-        except Exception as e:
+        except (OSError, IOError, ValueError) as e:
             print(f"Warning: Could not load state file {self.state_file}: {e}")
             return {'organizations': {}, 'template_state': {}}
 
@@ -115,8 +115,8 @@ class StateManager:
             if not new_hash:
                 try:
                     new_hash = hashlib.sha256(template_path.read_bytes()).hexdigest()
-                except Exception:
-                    return False, "Failed to calculate template hash"
+                except (OSError, IOError) as e:
+                    return False, f"Failed to calculate template hash: {e}"
 
             if 'template_state' not in state:
                 state['template_state'] = {}
@@ -147,8 +147,8 @@ class StateManager:
         if template_path.exists():
             try:
                 current_hash = hashlib.sha256(template_path.read_bytes()).hexdigest()
-            except Exception:
-                pass
+            except (OSError, IOError):
+                pass  # File read error, leave current_hash empty for display
 
         stored_hash = template_state.get('workflow_yml_hash', 'None')
         last_update = template_state.get('last_template_update', 'Never')

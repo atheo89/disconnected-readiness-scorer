@@ -35,7 +35,7 @@ class AutomationConfig:
                 print("Warning: No repository configuration found, no repos will be processed")
                 return set()
 
-        except Exception as e:
+        except (OSError, IOError, ValueError) as e:
             print(f"Warning: Could not load repository configuration: {e}")
             return set()
 

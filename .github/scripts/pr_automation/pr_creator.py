@@ -8,6 +8,8 @@ new workflow creation and enhancement of existing workflows.
 
 from dataclasses import dataclass
 
+from github import UnknownObjectException
+
 from .utils import retry_github_operation
 from .config import AutomationConfig
 from .workflows import TemplateRenderer, SimpleWorkflowManager, UpdateResult
@@ -55,16 +57,16 @@ class PRCreator:
                 for pr in open_prs:
                     pr.edit(state='closed')
                     print(f"    Closed existing PR #{pr.number} from branch '{branch_name}'")
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"    Warning: could not close existing PRs: {e}")
 
             # Check if branch exists and delete it
             try:
                 ref = repo.get_git_ref(f"heads/{branch_name}")
                 ref.delete()
                 print(f"    Deleted existing branch '{branch_name}'")
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"    Warning: could not delete branch (may not exist): {e}")
 
             # Create fresh branch
             repo.create_git_ref(f"refs/heads/{branch_name}", base_sha)
@@ -89,7 +91,7 @@ class PRCreator:
 
                 existing_file = retry_github_operation(_check_workflow_exists)
                 existing_content = existing_file.decoded_content.decode('utf-8')
-            except:
+            except UnknownObjectException:
                 pass  # File doesn't exist, we'll create a new one
 
             if existing_file and existing_content:

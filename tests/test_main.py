@@ -60,17 +60,17 @@ class TestParseArgs:
 
 class TestResolveRules:
     def test_all_returns_defaults(self):
-        from main import RULE_REGISTRY
+        from main import DEFAULT_RULES
         result = resolve_rules("all")
-        assert result == list(RULE_REGISTRY.keys())
+        assert result == list(DEFAULT_RULES)
 
     def test_empty_returns_defaults(self):
-        from main import RULE_REGISTRY
-        assert resolve_rules("") == list(RULE_REGISTRY.keys())
+        from main import DEFAULT_RULES
+        assert resolve_rules("") == list(DEFAULT_RULES)
 
     def test_none_returns_defaults(self):
-        from main import RULE_REGISTRY
-        assert resolve_rules(None) == list(RULE_REGISTRY.keys())
+        from main import DEFAULT_RULES
+        assert resolve_rules(None) == list(DEFAULT_RULES)
 
     def test_specific_rules(self):
         assert resolve_rules("csv,tags") == ["csv", "tags"]
