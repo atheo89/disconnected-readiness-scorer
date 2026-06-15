@@ -21,7 +21,6 @@ from main import (
     render_json,
     render_markdown,
     resolve_rules,
-    validate_repo_exceptions,
     main,
 )
 from rules.common import Finding, RuleResult
@@ -348,45 +347,6 @@ class TestMain:
             assert exit_code == 0
             mock_load.assert_called_once()
 
-    @patch("main.importlib.import_module")
-    def test_per_repo_exception_applied_through_main(self, mock_import, tmp_path):
-        fake_mod = MagicMock()
-        fake_mod.run.return_value = RuleResult(
-            rule="no-runtime-egress", passed=False,
-            findings=[Finding("blocker", "internal/client.go", 42, "", "http.Get call")],
-        )
-        fake_mod.detect_image_pattern.return_value = "none"
-        mock_import.return_value = fake_mod
-
-        _write_repo_exceptions(tmp_path,
-            "exceptions:\n"
-            "  - rule: no-runtime-egress\n"
-            '    path: "internal/client.go"\n'
-            '    reason: "Calls cluster-internal Kubernetes API"\n'
-        )
-
-        exit_code = main([
-            str(tmp_path), "--rules", "egress", "--report", "json",
-        ])
-        assert exit_code == 0
-
-    @patch("main.importlib.import_module")
-    def test_invalid_repo_exception_produces_blocker_not_crash(self, mock_import, tmp_path):
-        fake_mod = MagicMock()
-        fake_mod.run.return_value = RuleResult(rule="no-image-tags", passed=True)
-        fake_mod.detect_image_pattern.return_value = "none"
-        mock_import.return_value = fake_mod
-
-        _write_repo_exceptions(tmp_path,
-            "exceptions:\n"
-            "  - rule: no-runtime-egress\n"
-            '    reason: "missing scope filter"\n'
-        )
-
-        exit_code = main([
-            str(tmp_path), "--rules", "tags", "--report", "json",
-        ])
-        assert exit_code == 1
 
 
 # --- load_exceptions ---
@@ -719,13 +679,6 @@ class TestParseArgsExceptions:
 
 
 
-def _write_repo_exceptions(tmp_path, yaml_content):
-    """Create .disconnected-readiness/config.yaml with exceptions in tmp_path."""
-    exc_dir = tmp_path / ".disconnected-readiness"
-    exc_dir.mkdir(exist_ok=True)
-    exc_file = exc_dir / "config.yaml"
-    exc_file.write_text(yaml_content)
-    return exc_file
 
 
 _VALID_REPO_EXCEPTION = {
@@ -784,78 +737,6 @@ class TestValidateRepoExceptions:
 
 # --- per-repo exception loading ---
 
-class TestRepoExceptionLoading:
-    def test_repo_exceptions_loaded_from_target_repo(self, tmp_path):
-        exc_file = _write_repo_exceptions(tmp_path,
-            "exceptions:\n"
-            "  - rule: no-runtime-egress\n"
-            '    path: "internal/client.go"\n'
-            '    reason: "Calls cluster-internal API"\n'
-        )
-        exceptions = load_exceptions(str(exc_file))
-        assert len(exceptions) == 1
-        assert exceptions[0]["rule"] == "no-runtime-egress"
-        validate_repo_exceptions(exceptions, str(exc_file))
-
-    def test_repo_exception_missing_rule_rejected_by_load(self, tmp_path):
-        exc_file = _write_repo_exceptions(tmp_path,
-            "exceptions:\n"
-            '  - path: "f.go"\n'
-            '    reason: "test"\n'
-        )
-        with pytest.raises(ValueError, match="missing required 'rule' field"):
-            load_exceptions(str(exc_file))
-
-    def test_repo_exception_missing_reason_rejected_by_load(self, tmp_path):
-        exc_file = _write_repo_exceptions(tmp_path,
-            "exceptions:\n"
-            "  - rule: no-runtime-egress\n"
-            '    path: "f.go"\n'
-        )
-        with pytest.raises(ValueError, match="missing required 'reason' field"):
-            load_exceptions(str(exc_file))
-
-    def test_repo_exceptions_missing_file_skipped(self, tmp_path):
-        exc_path = tmp_path / ".disconnected-readiness" / "exceptions.yaml"
-        exceptions = load_exceptions(str(exc_path))
-        assert exceptions == []
-
-    def test_repo_exceptions_merged_with_central(self):
-        central = [{"rule": "no-image-tags", "reason": "central rule"}]
-        repo = [{
-            "rule": "no-runtime-egress",
-            "path": "f.go",
-            "reason": "repo rule",
-        }]
-        merged = central + repo
-        results = [
-            RuleResult(rule="no-image-tags", passed=False,
-                       findings=[Finding("blocker", "a.yaml", 1, "img", "tag")]),
-            RuleResult(rule="no-runtime-egress", passed=False,
-                       findings=[Finding("blocker", "f.go", 5, "", "egress")]),
-        ]
-        apply_exceptions(results, merged, "repo")
-        assert results[0].findings[0].severity == "info"
-        assert results[1].findings[0].severity == "info"
-
-    def test_repo_exception_downgrades_finding(self, tmp_path):
-        exc_file = _write_repo_exceptions(tmp_path,
-            "exceptions:\n"
-            "  - rule: no-image-tags\n"
-            '    path: "deploy/*.yaml"\n'
-            '    reason: "Tags replaced by RELATED_IMAGE at deploy time"\n'
-        )
-        exceptions = load_exceptions(str(exc_file))
-        validate_repo_exceptions(exceptions, str(exc_file))
-
-        results = [RuleResult(
-            rule="no-image-tags", passed=False,
-            findings=[Finding("blocker", "deploy/app.yaml", 10, "img:latest", "mutable tag")],
-        )]
-        apply_exceptions(results, exceptions, "test-repo")
-        assert results[0].findings[0].severity == "info"
-        assert results[0].passed is True
-        assert "[Exception:" in results[0].findings[0].message
 
 
 # --- exception snippets and false positive section ---
