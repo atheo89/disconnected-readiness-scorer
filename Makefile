@@ -25,31 +25,32 @@ skillsaw-fix: ## Auto-fix fixable skillsaw issues
 lint: ## Run all linters
 	@$(MAKE) skillsaw
 
-ARCH_ANALYZER_VERSION ?= v0.1.0
+ARCH_ANALYZER_VERSION ?= v0.1.1
 ARCH_ANALYZER_REPO := ugiordan/architecture-analyzer
-ARCH_ANALYZER_SHA256_darwin_arm64 := 6d57c439bf0562276cda00f8d7e321b5819e3de1e01831246af475b03187580a
-ARCH_ANALYZER_SHA256_linux_amd64  := 0d30cd39080fd771540bf404f86088d73c6db74e1a276f81a5c4597db05351f5
+ARCH_ANALYZER_SHA256_darwin_arm64 := 0835020ce26bf00fea889c38fa5afeab6164994caa149beb743876447a9dcec0
+ARCH_ANALYZER_SHA256_linux_amd64  := 972f7251657fa3c2748b8218cf6f5d7679c525080caeb8132fdad80862710e72
+
+_OS   := $(shell uname -s | tr '[:upper:]' '[:lower:]')
+_ARCH := $(shell uname -m)
+_ARCH := $(subst x86_64,amd64,$(_ARCH))
+_ARCH := $(subst aarch64,arm64,$(_ARCH))
+_BINARY := arch-analyzer-$(_OS)-$(_ARCH)
+_EXPECTED := $(ARCH_ANALYZER_SHA256_$(_OS)_$(_ARCH))
 
 .PHONY: install-arch-analyzer
 install-arch-analyzer: ## Download arch-analyzer binary to bin/
+	@if [ -z "$(_EXPECTED)" ]; then \
+		echo "ERROR: no pinned checksum for $(_OS)-$(_ARCH)"; exit 1; \
+	fi
 	@mkdir -p bin
-	@OS=$$(uname -s | tr '[:upper:]' '[:lower:]'); \
-	ARCH=$$(uname -m); \
-	case "$$ARCH" in x86_64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; esac; \
-	BINARY="arch-analyzer-$${OS}-$${ARCH}"; \
-	EXPECTED=$$(eval echo "\$$ARCH_ANALYZER_SHA256_$${OS}_$${ARCH}"); \
-	if [ -z "$$EXPECTED" ]; then \
-		echo "ERROR: no pinned checksum for $${OS}-$${ARCH}"; exit 1; \
-	fi; \
-	URL="https://github.com/$(ARCH_ANALYZER_REPO)/releases/download/$(ARCH_ANALYZER_VERSION)/$${BINARY}"; \
-	echo "Downloading $${BINARY} $(ARCH_ANALYZER_VERSION)..."; \
-	curl -fsSL "$$URL" -o bin/arch-analyzer && chmod +x bin/arch-analyzer; \
-	ACTUAL=$$(shasum -a 256 bin/arch-analyzer | awk '{print $$1}'); \
-	if [ "$$EXPECTED" = "$$ACTUAL" ]; then \
+	@echo "Downloading $(_BINARY) $(ARCH_ANALYZER_VERSION)..."
+	@curl -fsSL "https://github.com/$(ARCH_ANALYZER_REPO)/releases/download/$(ARCH_ANALYZER_VERSION)/$(_BINARY)" -o bin/arch-analyzer && chmod +x bin/arch-analyzer
+	@ACTUAL=$$(shasum -a 256 bin/arch-analyzer | awk '{print $$1}'); \
+	if [ "$(_EXPECTED)" = "$$ACTUAL" ]; then \
 		echo "OK: bin/arch-analyzer (sha256:$$ACTUAL)"; \
 	else \
 		echo "ERROR: checksum mismatch"; \
-		echo "  expected: $$EXPECTED"; \
+		echo "  expected: $(_EXPECTED)"; \
 		echo "  got:      $$ACTUAL"; \
 		rm -f bin/arch-analyzer; exit 1; \
 	fi

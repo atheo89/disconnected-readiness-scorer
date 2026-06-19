@@ -305,40 +305,40 @@ class TestRenderMarkdown:
 
 class TestMain:
     @patch("main.compute_production_scope", return_value=None)
-    @patch("main.importlib.import_module")
-    def test_all_pass_returns_0(self, mock_import, _mock_scope):
+    def test_all_pass_returns_0(self, _mock_scope):
         fake_mod = MagicMock()
         fake_mod.run.return_value = RuleResult(rule="test-rule", passed=True)
         fake_mod.detect_image_pattern.return_value = "static_csv"
-        mock_import.return_value = fake_mod
 
-        exit_code = main([".", "--rules", "csv,tags,egress,python", "--report", "json"])
+        with patch("main._run_arch_analyzer", return_value=None), \
+             patch("importlib.import_module", return_value=fake_mod):
+            exit_code = main([".", "--rules", "csv,tags,egress,python", "--report", "json"])
         assert exit_code == 0
 
     @patch("main.compute_production_scope", return_value=None)
-    @patch("main.importlib.import_module")
-    def test_blocker_returns_1(self, mock_import, _mock_scope):
+    def test_blocker_returns_1(self, _mock_scope):
         fake_mod = MagicMock()
         fake_mod.run.return_value = RuleResult(
             rule="test-rule", passed=False,
             findings=[Finding("blocker", "f.go", 1, "img", "fail")],
         )
         fake_mod.detect_image_pattern.return_value = "static_csv"
-        mock_import.return_value = fake_mod
 
-        exit_code = main([".", "--rules", "csv", "--report", "json"])
+        with patch("main._run_arch_analyzer", return_value=None), \
+             patch("importlib.import_module", return_value=fake_mod):
+            exit_code = main([".", "--rules", "csv", "--report", "json"])
         assert exit_code == 1
 
     @patch("main.compute_production_scope", return_value=None)
-    @patch("main.importlib.import_module")
-    def test_output_flag_writes_file(self, mock_import, _mock_scope, tmp_path):
+    def test_output_flag_writes_file(self, _mock_scope, tmp_path):
         fake_mod = MagicMock()
         fake_mod.run.return_value = RuleResult(rule="r", passed=True)
         fake_mod.detect_image_pattern.return_value = "static_csv"
-        mock_import.return_value = fake_mod
 
         out_file = tmp_path / "report.json"
-        exit_code = main([".", "--rules", "csv", "--report", "json", "-o", str(out_file)])
+        with patch("main._run_arch_analyzer", return_value=None), \
+             patch("importlib.import_module", return_value=fake_mod):
+            exit_code = main([".", "--rules", "csv", "--report", "json", "-o", str(out_file)])
         assert exit_code == 0
         content = out_file.read_text()
         data = json.loads(content.strip())
@@ -348,7 +348,8 @@ class TestMain:
     def test_manifest_rule_triggers_adapt(self, _mock_scope):
         fake_manifest = FakeManifest(images=[], components=[], known_issues=[])
 
-        with patch("main.load_manifest", return_value=(fake_manifest, set())) as mock_load, \
+        with patch("main._run_arch_analyzer", return_value=None), \
+             patch("main.load_manifest", return_value=(fake_manifest, set())) as mock_load, \
              patch("main.adapt_manifest_result", return_value=RuleResult(rule="operator-manifest")) as mock_adapt, \
              patch("importlib.import_module") as mock_import:
             mock_import.return_value = MagicMock()
@@ -365,7 +366,8 @@ class TestMain:
 
         fake_manifest = FakeManifest(images=[], components=[], known_issues=[])
 
-        with patch("main.load_manifest", return_value=(fake_manifest, set())) as mock_load, \
+        with patch("main._run_arch_analyzer", return_value=None), \
+             patch("main.load_manifest", return_value=(fake_manifest, set())) as mock_load, \
              patch("importlib.import_module", return_value=fake_mod):
             exit_code = main([".", "--rules", "csv", "--report", "json"])
             assert exit_code == 0
@@ -381,7 +383,8 @@ class TestLoadExceptions:
         exc_file.write_text(
             "exceptions:\n"
             "  - rule: no-runtime-egress\n"
-            '    path: "src/main.go"\n'
+            "    paths:\n"
+            '      - "src/main.go"\n'
             '    reason: "internal proxy"\n'
         )
         result = load_exceptions(str(exc_file))
@@ -407,25 +410,27 @@ class TestLoadExceptions:
         exc_file.write_text(
             "exceptions:\n"
             "  - rule: no-image-tags\n"
-            '    path: "deploy.yaml"\n'
+            "    paths:\n"
+            '      - "deploy.yaml"\n'
         )
-        with pytest.raises(ValueError, match="missing required 'reason' field"):
+        with pytest.raises(ValueError, match="reason"):
             load_exceptions(str(exc_file))
 
     def test_missing_rule_raises(self, tmp_path):
         exc_file = tmp_path / "exceptions.yaml"
         exc_file.write_text(
             "exceptions:\n"
-            '  - path: "deploy.yaml"\n'
+            "  - paths:\n"
+            '      - "deploy.yaml"\n'
             '    reason: "test"\n'
         )
-        with pytest.raises(ValueError, match="missing required 'rule' field"):
+        with pytest.raises(ValueError, match="rule"):
             load_exceptions(str(exc_file))
 
     def test_non_dict_entry_raises(self, tmp_path):
         exc_file = tmp_path / "exceptions.yaml"
         exc_file.write_text("exceptions:\n  - no-image-tags\n")
-        with pytest.raises(ValueError, match="must be a mapping"):
+        with pytest.raises(ValueError):
             load_exceptions(str(exc_file))
 
     def test_malformed_yaml_raises(self, tmp_path):
@@ -445,13 +450,14 @@ class TestLoadExceptions:
         exc_file.write_text(
             "exceptions:\n"
             "  - rule: no-image-tags, no-runtime-egress\n"
-            '    path: "install/*"\n'
+            "    paths:\n"
+            '      - "install/*"\n'
             '    reason: "historical snapshots"\n'
         )
         result = load_exceptions(str(exc_file))
         assert len(result) == 1
         assert result[0]["rule"] == "no-image-tags, no-runtime-egress"
-        assert result[0]["path"] == "install/*"
+        assert result[0]["paths"] == ["install/*"]
 
 
 
@@ -591,8 +597,8 @@ class TestApplyExceptions:
             ],
         )]
         exceptions = [
-            {"rule": "r", "path": "a.go", "reason": "ok"},
-            {"rule": "r", "path": "b.go", "reason": "ok"},
+            {"rule": "r", "paths": ["a.go"], "reason": "ok"},
+            {"rule": "r", "paths": ["b.go"], "reason": "ok"},
         ]
         apply_exceptions(results, exceptions, "repo")
         assert results[0].passed is True
@@ -619,7 +625,7 @@ class TestApplyExceptions:
         ]
         exceptions = [{
             "rule": "no-image-tags, no-runtime-egress",
-            "path": "install/*",
+            "paths": ["install/*"],
             "reason": "historical snapshots",
         }]
         apply_exceptions(results, exceptions, "repo")

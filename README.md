@@ -206,15 +206,14 @@ All policy-based exclusions (test dirs, CI dirs, build files, etc.) are configur
 
 ### Exception fields
 
-| Field     | Required | Description |
-|-----------|----------|-------------|
-| `rule`    | yes      | Rule name, comma-separated list, or `*` for all rules |
-| `reason`  | yes      | Why this exception exists |
-| `path`    | no       | Glob pattern matched against finding file path |
-| `paths`   | no       | List of glob patterns — matches if ANY pattern matches |
-| `image`   | no       | Glob pattern matched against finding image ref |
-| `message` | no       | Glob pattern matched against finding message |
-| `repo`    | no       | Repository name filter (matches basename or `org/repo` form) |
+| Field     | Required | Description                                                   |
+|-----------|----------|---------------------------------------------------------------|
+| `rule`    | yes      | Rule name, comma-separated list, or `*` for all rules         |
+| `reason`  | yes      | Why this exception exists                                     |
+| `paths`   | no       | List of glob patterns — matches if ANY pattern matches        |
+| `image`   | no       | Glob pattern matched against finding image ref                |
+| `message` | no       | Glob pattern matched against finding message                  |
+| `repo`    | no       | Repo name or `org/repo` — scopes exception to one component   |
 
 Path patterns support `**/` prefix to match at any depth (e.g. `**/Dockerfile` matches both `Dockerfile` and `build/Dockerfile`). Patterns ending with `/**` also match the directory itself (e.g. `**/config/scorecard/**` matches both `config/scorecard` and `config/scorecard/foo.yaml`).
 
@@ -275,7 +274,7 @@ exceptions:
 
 ### Configuration
 
-All configuration is managed centrally in `config/config.yaml`. No per-repository configuration files are supported.
+All configuration is managed centrally in `config/config.yaml`. No per-repository configuration files are supported — repo-specific exceptions use the `repo` field in the central config.
 
 ## Reporting False Positives
 
@@ -298,14 +297,22 @@ Exceptions are managed centrally in the scorer repository's `config/config.yaml`
 
 ```yaml
 exceptions:
+  # Repo-specific: scoped to one component via 'repo' field
   - rule: no-runtime-egress
+    repo: my-component
     paths:
       - "internal/client.go"
     reason: "Calls cluster-internal Kubernetes API at kubernetes.default.svc"
     # reference: "https://issues.redhat.com/browse/RHOAIENG-XXXXX"  # optional, for scanner bugs
+
+  # Cross-component: applies to all repos (no 'repo' field)
+  - rule: no-runtime-egress
+    paths:
+      - "**/internal/cluster/**"
+    reason: "Internal cluster calls — not external egress"
 ```
 
-Add this file in the same PR that is being blocked. The scanner loads it automatically and downgrades matching findings to info severity.
+Add this exception to the scorer's `config/config.yaml`. Use the `repo` field to scope it to a specific component, or omit it for a cross-component exception that applies to all repos. The scanner loads the central config automatically and downgrades matching findings to info severity.
 
 If you think a finding is caused by a bug in the scanner (not just a repo-specific exclusion), file a Jira ticket under RHOAIENG and add the ticket URL as a `reference` in your exception entry. The AI Core Platform team triages these and either fixes the rule or confirms the exception is permanent.
 
@@ -313,9 +320,7 @@ If you think a finding is caused by a bug in the scanner (not just a repo-specif
 
 **"at least one scope filter"** — Include `paths`, `image`, or `message` to limit the exception. Disabling an entire rule is not allowed.
 
-**"'repo' field is not allowed"** — Per-repo exceptions apply only to the current repository. Remove the `repo:` field.
-
-**"unknown field(s)"** — Check for typos in field names. Valid fields: `rule`, `paths`, `image`, `message`, `reason`, `reference`.
+**"unknown field(s)"** — Check for typos in field names. Valid fields: `rule`, `repo`, `paths`, `image`, `message`, `reason`, `reference`.
 
 ## PR Integration
 

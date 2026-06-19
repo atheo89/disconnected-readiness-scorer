@@ -170,8 +170,20 @@ def _is_glob_source(source_stripped: str) -> bool:
 
 
 def _normalize_glob(source_stripped: str) -> str:
-    """Convert ${VAR} tokens to ** for globbing (arch-analyzer may do this already)."""
-    return _DOCKER_ARG_RE.sub("**", source_stripped)
+    """Convert ${VAR} tokens to glob wildcards.
+
+    Use ** when the token is the entire path component (e.g. ${VAR}/foo),
+    * when it appears mid-component (e.g. file.${EXT}.txt) since ** is
+    only valid as a complete path segment in Path.glob().
+    """
+    def _replace(m):
+        start, end = m.start(), m.end()
+        at_start = start == 0 or source_stripped[start - 1] == "/"
+        at_end = end == len(source_stripped) or source_stripped[end] == "/"
+        if at_start and at_end:
+            return "**"
+        return "*"
+    return _DOCKER_ARG_RE.sub(_replace, source_stripped)
 
 
 def _glob_source(source_stripped: str, repo_root: Path, resolved_root: Path) -> list[Path]:
@@ -183,10 +195,13 @@ def _glob_source(source_stripped: str, repo_root: Path, resolved_root: Path) -> 
     if glob_pat == "**":
         return []
     results = []
-    for match in repo_root.glob(glob_pat):
-        resolved = match.resolve()
-        if resolved != resolved_root:
-            results.append(match)
+    try:
+        for match in repo_root.glob(glob_pat):
+            resolved = match.resolve()
+            if resolved != resolved_root:
+                results.append(match)
+    except ValueError:
+        return []
     return results
 
 
@@ -196,9 +211,12 @@ def _find_go_module_dir(all_sources: list[str], repo_root: Path) -> Optional[Pat
         pat = _normalize_glob(s.strip("/"))
         if "go.mod" not in pat:
             continue
-        for match in repo_root.glob(pat):
-            if match.is_file() and match.name == "go.mod":
-                return match.parent.resolve()
+        try:
+            for match in repo_root.glob(pat):
+                if match.is_file() and match.name == "go.mod":
+                    return match.parent.resolve()
+        except ValueError:
+            continue
     return None
 
 

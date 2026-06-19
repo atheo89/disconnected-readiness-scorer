@@ -20,6 +20,8 @@
 | {{ f.rule }} | {{ f.file }} | {{ f.line }} | {{ f.message }} |
 {% endfor %}
 
+{{ exceptions_section }}
+
 {{ false_positive_section }}
 
 ---

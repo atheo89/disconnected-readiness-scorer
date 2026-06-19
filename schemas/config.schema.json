@@ -4,11 +4,6 @@
   "description": "Configuration for the disconnected readiness scanner. Used only by central config (config/config.yaml).",
   "type": "object",
   "properties": {
-    "kustomize_overlays": {
-      "type": "array",
-      "items": { "type": "string" },
-      "description": "Kustomize overlay dirs (relative to repo root) to validate. When set, the params-env-wiring rule only builds these dirs. Typically only used in per-repo config."
-    },
     "exceptions": {
       "type": "array",
       "description": "Exception rules that downgrade matching blocker findings to info severity.",
@@ -61,29 +56,6 @@
         "type": "object",
         "description": "Mapping of Dockerfile path → context directory for a specific repo.",
         "additionalProperties": { "type": "string" }
-      }
-    },
-    "params_env_ignore": {
-      "type": "array",
-      "description": "params.env keys to exclude from validation. Typically only used in per-repo config.",
-      "items": {
-        "type": "object",
-        "required": ["key", "reason"],
-        "properties": {
-          "key": {
-            "type": "string",
-            "description": "The params.env key name to ignore."
-          },
-          "reason": {
-            "type": "string",
-            "description": "Why this key is excluded."
-          },
-          "reference": {
-            "type": "string",
-            "description": "Tracking URL for the exclusion."
-          }
-        },
-        "additionalProperties": false
       }
     },
     "params_env_filenames": {

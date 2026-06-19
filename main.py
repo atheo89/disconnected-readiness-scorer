@@ -18,12 +18,10 @@ from datetime import date
 from fnmatch import fnmatch
 from pathlib import Path
 
+import jsonschema
 import yaml
 
-from rules.common import (
-    Finding, RuleResult, ConfigError, CONFIG_DIR, CONFIG_FILE,
-    load_repo_config, load_config_file,
-)
+from rules.common import Finding, RuleResult
 from rules.production_scope import compute_production_scope
 
 SEVERITY_ORDER = {"blocker": 0, "info": 1}
@@ -32,7 +30,6 @@ SEVERITY_ORDER = {"blocker": 0, "info": 1}
 class ArchAnalyzerError(Exception):
     """Raised when arch-analyzer binary is missing or fails."""
 CENTRAL_CONFIG_PATH = "config/config.yaml"
-REPO_CONFIG_PATH = f"{CONFIG_DIR}/{CONFIG_FILE}"
 
 RULE_REGISTRY = {
     "csv": {
@@ -83,6 +80,23 @@ def _load_yaml_file(config_path):
         ) from exc
 
 
+_SCHEMA_PATH = Path(__file__).parent / "schemas" / "config.schema.json"
+
+
+def _validate_config_schema(raw, config_path):
+    """Validate config dict against schemas/config.schema.json."""
+    try:
+        schema = json.loads(_SCHEMA_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    try:
+        jsonschema.validate(raw, schema)
+    except jsonschema.ValidationError as exc:
+        raise ValueError(
+            f"{config_path}: schema validation error: {exc.message}"
+        ) from exc
+
+
 def load_central_config(config_path):
     raw = _load_yaml_file(config_path)
     if raw is None:
@@ -91,6 +105,7 @@ def load_central_config(config_path):
         raise ValueError(
             f"{config_path} must be a YAML mapping, got {type(raw).__name__}"
         )
+    _validate_config_schema(raw, config_path)
     exceptions = raw.get("exceptions") or []
     _validate_exceptions(exceptions, config_path)
     return {
@@ -146,12 +161,16 @@ def _path_matches(filepath: str, pattern: str) -> bool:
 
 
 def apply_exceptions(results, exceptions, repo_name):
-    """Downgrade blocker findings that match configured exceptions to info severity."""
+    """Downgrade blocker findings that match configured exceptions to info severity.
+
+    Returns a list of hit counts, one per exception entry (parallel to exceptions list).
+    """
+    hits = [0] * len(exceptions)
     for result in results:
         for finding in result.findings:
             if finding.severity != "blocker":
                 continue
-            for exc in exceptions:
+            for i, exc in enumerate(exceptions):
                 exc_rule = exc.get("rule", "")
                 if exc_rule != "*":
                     exc_rules = [r.strip() for r in exc_rule.split(",")]
@@ -180,70 +199,12 @@ def apply_exceptions(results, exceptions, repo_name):
                 reason = exc.get("reason", "configured exception")
                 finding.message += f" [Exception: {reason}]"
                 finding.severity = "info"
+                hits[i] += 1
                 break
         if not any(f.severity == "blocker" for f in result.findings):
             result.passed = True
+    return hits
 
-
-def validate_repo_exceptions(exceptions, config_path):
-    """Validate per-repo exceptions.
-
-    Checks all constraints: required fields (rule, reason), unknown fields,
-    forbidden repo field, scope filter requirement, and type correctness.
-    """
-    known_fields = {"rule", "paths", "image", "message", "reason", "reference", "repo"}
-    for i, exc in enumerate(exceptions):
-        if not isinstance(exc, dict):
-            raise ValueError(
-                f"Exception entry {i + 1} in {config_path} "
-                f"must be a mapping, got {type(exc).__name__}"
-            )
-
-        label = f"Exception entry {i + 1} (rule={exc.get('rule', '?')}) in {config_path}"
-
-        if not exc.get("rule"):
-            raise ValueError(
-                f"Exception entry {i + 1} in {config_path} "
-                f"is missing required 'rule' field"
-            )
-        if not exc.get("reason"):
-            raise ValueError(
-                f"{label} is missing required 'reason' field"
-            )
-
-        unknown = set(exc.keys()) - known_fields
-        if unknown:
-            raise ValueError(
-                f"{label} has unknown field(s): {', '.join(sorted(unknown))}. "
-                f"Valid fields: {', '.join(sorted(known_fields))}"
-            )
-
-        if "repo" in exc:
-            raise ValueError(
-                f"{label}: 'repo' field is not allowed in per-repo exception files"
-            )
-
-        for field in ("image", "message"):
-            val = exc.get(field)
-            if val is not None and not isinstance(val, str):
-                raise ValueError(
-                    f"{label}: '{field}' must be a string, "
-                    f"got {type(val).__name__}"
-                )
-
-        paths_val = exc.get("paths")
-        if paths_val is not None:
-            if not isinstance(paths_val, list) or not all(isinstance(p, str) for p in paths_val):
-                raise ValueError(
-                    f"{label}: 'paths' must be a list of strings"
-                )
-
-        has_scope = any(exc.get(f) for f in ("paths", "image", "message"))
-        if not has_scope:
-            raise ValueError(
-                f"{label} must have at least one scope filter "
-                f"(path, image, or message)"
-            )
 
 
 def parse_args(argv=None):
@@ -379,7 +340,7 @@ def print_summary(score, results):
     print(f"\nBlockers: {total_blockers} | Passed: {total_passed}", file=sys.stderr)
 
 
-def render_json(score, results, repo_name, verbose=False):
+def render_json(score, results, repo_name, verbose=False, exceptions=None, exception_hits=None):
     snippets = _build_exception_snippets(results)
     rules_data = []
     for r in results:
@@ -404,6 +365,16 @@ def render_json(score, results, repo_name, verbose=False):
         "score": score,
         "rules": rules_data,
     }
+    if exceptions and exception_hits:
+        data["exceptions"] = [
+            {
+                "rule": exc.get("rule", ""),
+                "reason": exc.get("reason", ""),
+                **({"repo": exc["repo"]} if exc.get("repo") else {}),
+                "hits": exception_hits[i],
+            }
+            for i, exc in enumerate(exceptions)
+        ]
     if snippets:
         data["false_positive_help"] = {
             "exception_snippets": snippets,
@@ -512,7 +483,33 @@ def _build_false_positive_section(snippets):
     return "\n".join(lines)
 
 
-def render_markdown(score, results, repo_name):
+def _build_exceptions_section(exceptions, exception_hits):
+    """Build the Applied Exceptions markdown section."""
+    if not exceptions or not exception_hits:
+        return ""
+    applied = [
+        (exc, exception_hits[i])
+        for i, exc in enumerate(exceptions)
+        if exception_hits[i] > 0
+    ]
+    if not applied:
+        return ""
+    lines = [
+        "## Applied Exceptions",
+        "",
+        "| Rule | Repo | Reason | Hits |",
+        "|------|------|--------|------|",
+    ]
+    for exc, hits in applied:
+        rule = _escape_md_cell(exc.get("rule", ""))
+        repo = _escape_md_cell(exc.get("repo", ""))
+        reason = _escape_md_cell(exc.get("reason", ""))
+        lines.append(f"| {rule} | {repo} | {reason} | {hits} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_markdown(score, results, repo_name, exceptions=None, exception_hits=None):
     template_path = Path(__file__).parent / "templates" / "report.md"
     try:
         template_str = template_path.read_text()
@@ -543,6 +540,7 @@ def render_markdown(score, results, repo_name):
             for r in results
         ],
         "blockers": blocker_rows,
+        "exceptions_section": _build_exceptions_section(exceptions, exception_hits),
         "false_positive_section": _build_false_positive_section(
             _build_exception_snippets(results)
         ),
@@ -578,45 +576,16 @@ def _get_repo_name(repo_root):
     return os.path.basename(repo_root)
 
 
-def _load_all_exceptions(args, repo_root, repo_config):
-    """Load central and per-repo exceptions, validate, and merge.
+def _load_all_exceptions(args):
+    """Load exceptions from central config.
 
-    Returns (merged_exceptions, error_result_or_None).
+    Returns (exceptions, error_result_or_None).
     """
     config_path = args.config or str(
         Path(__file__).parent / CENTRAL_CONFIG_PATH
     )
     central = load_central_config(config_path)
-    exceptions = central["exceptions"]
-
-    repo_exceptions = repo_config.get("exceptions") or []
-    if getattr(args, "repo_config", None):
-        repo_config_path = args.repo_config
-    else:
-        repo_config_path = str(Path(repo_root) / REPO_CONFIG_PATH)
-    try:
-        if repo_exceptions:
-            validate_repo_exceptions(repo_exceptions, repo_config_path)
-            print(
-                f"  Loaded {len(repo_exceptions)} per-repo exception(s) "
-                f"from {REPO_CONFIG_PATH}",
-                file=sys.stderr,
-            )
-            exceptions = exceptions + repo_exceptions
-    except ValueError as exc:
-        error_result = RuleResult(
-            rule="repo-exceptions-validation", passed=False
-        )
-        error_result.findings.append(Finding(
-            severity="blocker",
-            file=repo_config_path,
-            line=0,
-            image="",
-            message=f"Invalid per-repo exceptions: {exc}",
-        ))
-        return exceptions, error_result
-
-    return exceptions, None
+    return central["exceptions"], None
 
 
 def _run_arch_analyzer(arch_analyzer_bin: str, target_dir: str) -> dict:
@@ -723,19 +692,6 @@ def _run(args, operator_path, *,
         manifest, manifest_env_vars = load_manifest(operator_path)
         _vlog(f"load_manifest: {time.monotonic() - t0:.1f}s")
 
-    try:
-        if getattr(args, "repo_config", None):
-            _vlog(f"Loading repo config from {args.repo_config}")
-            repo_config = load_config_file(Path(args.repo_config))
-        else:
-            _vlog(f"Loading repo config from {repo_root}/{REPO_CONFIG_PATH}")
-            repo_config = load_repo_config(Path(repo_root))
-    except ConfigError as exc:
-        print(f"  WARNING: {exc}", file=sys.stderr)
-        repo_config = {}
-    _vlog(f"Repo config keys: {list(repo_config.keys()) if repo_config else 'empty'}")
-
-
     # --- Run arch-analyzer (REQUIRED) ---
     t0 = time.monotonic()
     if operator_arch_data is None:
@@ -767,14 +723,7 @@ def _run(args, operator_path, *,
                 )
 
             # Determine overlay paths
-            repo_config_overlays = repo_config.get("kustomize_overlays") if repo_config else None
-            if repo_config_overlays:
-                overlay_paths = repo_config_overlays
-                print(
-                    f"  Overlay paths (from repo config): {overlay_paths}",
-                    file=sys.stderr,
-                )
-            elif operator_arch_data:
+            if operator_arch_data:
                 component_key = component_keys_map.get(repo_basename)
                 if component_key:
                     raw_overlays = op_manifest_mod.parse_overlay_paths_from_arch_data(
@@ -848,11 +797,10 @@ def _run(args, operator_path, *,
         _vlog(f"rule {key}: {time.monotonic() - t0:.1f}s")
         results.append(result)
 
-    exceptions, error_result = _load_all_exceptions(args, repo_root, repo_config)
+    exceptions, error_result = _load_all_exceptions(args)
     if error_result:
         results.insert(0, error_result)
-    if exceptions:
-        apply_exceptions(results, exceptions, repo_name)
+    exception_hits = apply_exceptions(results, exceptions, repo_name) if exceptions else []
 
     score = compute_score(results)
     print_summary(score, results)
@@ -865,11 +813,13 @@ def _run(args, operator_path, *,
 
     outputs = args.output or []
 
+    exc_args = dict(exceptions=exceptions, exception_hits=exception_hits) if verbose else {}
+
     for i, fmt in enumerate(formats):
         if fmt == "json":
-            report = render_json(score, results, repo_name, verbose=verbose)
+            report = render_json(score, results, repo_name, verbose=verbose, **exc_args)
         else:
-            report = render_markdown(score, results, repo_name)
+            report = render_markdown(score, results, repo_name, **exc_args)
 
         if i < len(outputs):
             Path(outputs[i]).write_text(report + "\n")
