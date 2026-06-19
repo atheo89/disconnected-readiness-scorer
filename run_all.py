@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """Batch runner — score all ODH component repos for disconnected readiness.
 
-Reads .github/config/repositories.yaml, clones each repo, runs main.py,
-and produces per-repo JSON reports plus an aggregate summary.
+Reads .github/config/repositories.yaml, clones each repo, runs the scorer
+in-process, and produces per-repo JSON reports plus an aggregate summary.
+
+Performance optimizations over subprocess-per-repo approach:
+- Operator manifest parsed once, reused across all repos
+- Operator arch-analyzer data computed once, reused across all repos
+- arch-analyzer pre-run on all repos in parallel before scoring
+- Dual output (JSON + markdown) in a single scorer run per repo
 """
 
 import argparse
+import io
 import json
 import re
 import shutil
@@ -13,10 +20,14 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import redirect_stdout, redirect_stderr
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 GITHUB_URL = "https://github.com"
+
+ARCH_ANALYZER_BIN = str(Path(__file__).parent / "bin" / "arch-analyzer")
 
 
 def load_repos(config_path):
@@ -71,32 +82,6 @@ def clone_repo(org, repo, dest):
     return True, ""
 
 
-SCORER_TIMEOUT = 300
-
-
-def run_scorer(repo_path, operator_path, output_path, report_format="json",
-               exceptions=None, timing=False):
-    script = Path(__file__).parent / "main.py"
-    cmd = [
-        sys.executable, str(script),
-        str(repo_path),
-        "--report", report_format,
-        "--operator-path", str(operator_path),
-        "-o", str(output_path),
-    ]
-    if exceptions:
-        cmd += ["--config", exceptions]
-    if timing:
-        cmd += ["--timing"]
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=SCORER_TIMEOUT,
-        )
-        return result.returncode, result.stderr
-    except subprocess.TimeoutExpired:
-        return 1, f"TIMEOUT after {SCORER_TIMEOUT}s"
-
-
 def clone_operator(dest):
     url = f"{GITHUB_URL}/opendatahub-io/opendatahub-operator.git"
     cmd = [
@@ -106,6 +91,43 @@ def clone_operator(dest):
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise SystemExit(f"Failed to clone operator: {result.stderr.strip()}")
+
+
+def _run_arch_analyzer_on_dir(target_dir):
+    """Run arch-analyzer binary on a single directory. Returns (dir, ok, error)."""
+    json_path = Path(target_dir) / "component-architecture.json"
+    if json_path.exists():
+        json_path.unlink()
+
+    try:
+        subprocess.run(
+            [ARCH_ANALYZER_BIN, "extract", ".", "--extractors", "docker,kustomize"],
+            cwd=str(target_dir),
+            capture_output=True, timeout=300, check=True,
+        )
+        return str(target_dir), True, ""
+    except subprocess.CalledProcessError as e:
+        stderr_msg = e.stderr.decode(errors='replace') if e.stderr else str(e)
+        return str(target_dir), False, stderr_msg
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return str(target_dir), False, str(e)
+
+
+def run_arch_analyzer_batch(dirs):
+    """Run arch-analyzer on multiple directories in parallel."""
+    if not Path(ARCH_ANALYZER_BIN).is_file():
+        raise SystemExit(
+            f"ERROR: arch-analyzer binary not found at {ARCH_ANALYZER_BIN}.\n"
+            f"       Install with: make install-arch-analyzer"
+        )
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(len(dirs), 8)) as pool:
+        futures = {pool.submit(_run_arch_analyzer_on_dir, d): d for d in dirs}
+        for future in as_completed(futures):
+            target_dir, ok, error = future.result()
+            results[target_dir] = (ok, error)
+    return results
 
 
 def generate_summary(output_dir, results):
@@ -216,8 +238,9 @@ def parse_args(argv=None):
         help="Run N repos concurrently (default: 4). Use 1 for sequential.",
     )
     parser.add_argument(
-        "--timing", action="store_true",
-        help="Pass --timing to main.py and show per-repo wall time.",
+        "--verbose", "-v", action="store_true",
+        help="Pass --verbose to main.py for detailed diagnostic output "
+             "(includes per-step timing and files_checked in JSON).",
     )
     return parser.parse_args(argv)
 
@@ -244,67 +267,9 @@ def main(argv=None):
     repos_dir = Path(__file__).parent / ".repos"
     repos_dir.mkdir(exist_ok=True)
 
-    def process_repo(i, entry, operator_path):
-        org = entry["org"]
-        repo = entry["repo"]
-        json_path = output_dir / f"{repo}.json"
-        log = []
-
-        log.append(f"[{i}/{total}] {org}/{repo}")
-
-        repo_dir = repos_dir / repo
-        if (repo_dir / ".git").is_dir():
-            log.append(f"    Using cached clone at {repo_dir}")
-        else:
-            if repo_dir.exists():
-                shutil.rmtree(repo_dir)
-            t0 = time.monotonic()
-            ok, clone_err = clone_repo(org, repo, repo_dir)
-            if not ok:
-                log.append(f"    SKIP — clone failed: {clone_err}")
-                return i, entry, "\n".join(log)
-            if args.timing:
-                log.append(f"    [timing] clone: {time.monotonic() - t0:.1f}s")
-
-        t1 = time.monotonic()
-        rc, scorer_log = run_scorer(
-            repo_dir, operator_path, json_path, "json",
-            args.config, timing=args.timing,
-        )
-        elapsed = time.monotonic() - t1
-
-        md_path = output_dir / f"{repo}.md"
-        run_scorer(repo_dir, operator_path, md_path, "markdown",
-                   args.config, timing=False)
-
-        if scorer_log.strip():
-            for line in scorer_log.strip().splitlines():
-                log.append(f"    {line}")
-        status = "OK" if rc == 0 else "NOT READY"
-        log.append(f"    → {status} ({elapsed:.1f}s)")
-        return i, entry, "\n".join(log)
-
-    def run_with_operator(operator_path):
-        if args.parallel > 1:
-            print(f"Running {args.parallel} repos in parallel...\n", file=sys.stderr)
-            with ThreadPoolExecutor(max_workers=args.parallel) as pool:
-                futures = [
-                    pool.submit(process_repo, i, entry, operator_path)
-                    for i, entry in enumerate(repos, 1)
-                ]
-                results_unordered = [f.result() for f in as_completed(futures)]
-            results_ordered = sorted(results_unordered, key=lambda r: r[0])
-        else:
-            results_ordered = [process_repo(i, e, operator_path) for i, e in enumerate(repos, 1)]
-
-        for _, _, log in results_ordered:
-            print(log, file=sys.stderr)
-            print("", file=sys.stderr)
-
-        return [entry for _, entry, _ in results_ordered]
-
+    # --- Phase 0: Ensure operator clone ---
     if args.operator_path:
-        results = run_with_operator(args.operator_path)
+        operator_path = args.operator_path
     else:
         op_dir = repos_dir / "opendatahub-operator"
         if (op_dir / ".git").is_dir():
@@ -314,10 +279,120 @@ def main(argv=None):
                 shutil.rmtree(op_dir)
             print("Cloning opendatahub-operator (shared)...", file=sys.stderr)
             clone_operator(str(op_dir))
-        print("", file=sys.stderr)
-        results = run_with_operator(str(op_dir))
+        operator_path = str(op_dir)
 
-    summary = generate_summary(output_dir, results)
+    # --- Phase 1: Clone all repos ---
+    repo_dirs = {}
+    for i, entry in enumerate(repos, 1):
+        org, repo = entry["org"], entry["repo"]
+        repo_dir = repos_dir / repo
+        if (repo_dir / ".git").is_dir():
+            print(f"  [{i}/{total}] {org}/{repo} — cached", file=sys.stderr)
+        else:
+            if repo_dir.exists():
+                shutil.rmtree(repo_dir)
+            t0 = time.monotonic()
+            ok, clone_err = clone_repo(org, repo, repo_dir)
+            if not ok:
+                print(f"  [{i}/{total}] {org}/{repo} — SKIP (clone failed: {clone_err})", file=sys.stderr)
+                continue
+            elapsed = time.monotonic() - t0
+            print(f"  [{i}/{total}] {org}/{repo} — cloned ({elapsed:.1f}s)", file=sys.stderr)
+        repo_dirs[repo] = str(repo_dir)
+    print("", file=sys.stderr)
+
+    # --- Phase 2: Run arch-analyzer in parallel (operator + all repos) ---
+    print("Running arch-analyzer on all repos...", file=sys.stderr)
+    t0 = time.monotonic()
+    arch_dirs = [operator_path] + list(repo_dirs.values())
+    arch_results = run_arch_analyzer_batch(arch_dirs)
+    elapsed = time.monotonic() - t0
+    print(f"  arch-analyzer complete ({elapsed:.1f}s)\n", file=sys.stderr)
+
+    for d, (ok, error) in arch_results.items():
+        if not ok:
+            print(f"  WARNING: arch-analyzer failed on {d}: {error}", file=sys.stderr)
+
+    # --- Phase 3: Pre-compute operator data (once) ---
+    from main import _run, load_manifest, _run_arch_analyzer
+
+    t0 = time.monotonic()
+    manifest, manifest_env_vars = load_manifest(operator_path)
+    operator_arch_data = _run_arch_analyzer(ARCH_ANALYZER_BIN, operator_path)
+    elapsed = time.monotonic() - t0
+    print(f"Operator data loaded ({elapsed:.1f}s)\n", file=sys.stderr)
+
+    # --- Phase 4: Score repos (in-process, dual output) ---
+    def process_repo(i, entry):
+        org, repo = entry["org"], entry["repo"]
+        if repo not in repo_dirs:
+            return i, entry, f"[{i}/{total}] {org}/{repo}\n    SKIP — clone failed"
+
+        repo_dir = repo_dirs[repo]
+        json_path = str(output_dir / f"{repo}.json")
+        md_path = str(output_dir / f"{repo}.md")
+
+        scorer_args = SimpleNamespace(
+            repo_root=repo_dir,
+            rules="all",
+            report="json,markdown",
+            output=[json_path, md_path],
+            operator_path=operator_path,
+            config=args.config,
+            repo_config=None,
+            no_production_scope=False,
+            verbose=args.verbose,
+            arch_analyzer=ARCH_ANALYZER_BIN,
+        )
+
+        log_lines = [f"[{i}/{total}] {org}/{repo}"]
+        stderr_capture = io.StringIO()
+        t1 = time.monotonic()
+
+        try:
+            with redirect_stderr(stderr_capture):
+                rc = _run(
+                    scorer_args, operator_path,
+                    manifest=manifest,
+                    manifest_env_vars=manifest_env_vars,
+                    operator_arch_data=operator_arch_data,
+                )
+        except SystemExit as e:
+            rc = e.code if isinstance(e.code, int) else 1
+        except Exception as e:
+            rc = 1
+            print(f"    ERROR: {e}", file=sys.stderr)
+
+        elapsed = time.monotonic() - t1
+
+        stderr_text = stderr_capture.getvalue().strip()
+        if stderr_text:
+            for line in stderr_text.splitlines():
+                log_lines.append(f"    {line}")
+
+        status = "OK" if rc == 0 else "NOT READY"
+        log_lines.append(f"    → {status} ({elapsed:.1f}s)")
+        return i, entry, "\n".join(log_lines)
+
+    if args.parallel > 1:
+        print(f"Scoring {len(repo_dirs)} repos ({args.parallel} parallel)...\n", file=sys.stderr)
+        with ThreadPoolExecutor(max_workers=args.parallel) as pool:
+            futures = [
+                pool.submit(process_repo, i, entry)
+                for i, entry in enumerate(repos, 1)
+            ]
+            results_unordered = [f.result() for f in as_completed(futures)]
+        results_ordered = sorted(results_unordered, key=lambda r: r[0])
+    else:
+        results_ordered = [process_repo(i, e) for i, e in enumerate(repos, 1)]
+
+    for _, _, log in results_ordered:
+        print(log, file=sys.stderr)
+        print("", file=sys.stderr)
+
+    all_entries = [entry for _, entry, _ in results_ordered]
+
+    summary = generate_summary(output_dir, all_entries)
     print((output_dir / "summary.md").read_text(), file=sys.stderr)
     print(f"Reports saved to {output_dir}/", file=sys.stderr)
 

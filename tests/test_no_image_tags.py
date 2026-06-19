@@ -204,15 +204,16 @@ class TestProductionScope:
         pkg.mkdir()
         f = pkg / "images.go"
         f.write_text('var img = "quay.io/org/app:v1.0"')
-        other = tmp_path / "main.go"
+        cmd = tmp_path / "cmd"
+        cmd.mkdir()
+        other = cmd / "main.go"
         other.write_text("package main\n")
         scope = ProductionScope(
-            production_files={other.resolve()}, method="go-import-graph",
+            production_dirs={cmd.resolve()}, method="go-import-graph",
         )
         result = run(str(tmp_path), production_scope=scope)
         assert result.passed is True
-        assert result.findings[0].severity == "info"
-        assert "[out of production scope]" in result.findings[0].message
+        assert len(result.findings) == 0
 
     def test_in_scope_go_file_stays_blocker(self, tmp_path):
         pkg = tmp_path / "pkg"
@@ -220,7 +221,7 @@ class TestProductionScope:
         f = pkg / "images.go"
         f.write_text('var img = "quay.io/org/app:v1.0"')
         scope = ProductionScope(
-            production_files={f.resolve()},
+            production_dirs={f.parent.resolve()},
             method="go-import-graph",
         )
         result = run(str(tmp_path), production_scope=scope)
@@ -230,7 +231,7 @@ class TestProductionScope:
     def test_non_go_file_unaffected(self, tmp_path):
         f = tmp_path / "deploy.yaml"
         f.write_text("image: quay.io/org/app:v1.0")
-        scope = ProductionScope(production_files=set(), method="go-import-graph")
+        scope = ProductionScope(method="go-import-graph")
         result = run(str(tmp_path), production_scope=scope)
         assert result.findings[0].severity == "blocker"
 class TestOciUri:
@@ -272,17 +273,20 @@ class TestOciUri:
         assert findings[0].severity == "info"
 
     def test_oci_uri_out_of_production_scope_downgraded(self, tmp_path):
-        f = tmp_path / "test_utils.go"
+        test_dir = tmp_path / "tests"
+        test_dir.mkdir()
+        f = test_dir / "test_utils.go"
         f.write_text('uri := "oci://quay.io/org/test-model"')
-        other = tmp_path / "main.go"
+        cmd = tmp_path / "cmd"
+        cmd.mkdir()
+        other = cmd / "main.go"
         other.write_text("package main\n")
         scope = ProductionScope(
-            production_files={other.resolve()}, method="go-import-graph",
+            production_dirs={cmd.resolve()}, method="go-import-graph",
         )
         result = run(str(tmp_path), production_scope=scope)
         oci_findings = [f for f in result.findings if "oci://" in f.image]
-        assert len(oci_findings) == 1
-        assert oci_findings[0].severity == "info"
+        assert len(oci_findings) == 0
 
     def test_plain_path_not_matched(self, tmp_path):
         f = tmp_path / "main.go"

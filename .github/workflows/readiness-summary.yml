@@ -40,6 +40,7 @@ jobs:
       - name: Install dependencies
         run: |
           uv sync --extra report --frozen
+          make install-arch-analyzer
 
       - name: Run batch scorer
         env:
@@ -52,16 +53,6 @@ jobs:
             args+=(--repo "$INPUT_REPO")
           fi
           uv run run_all.py "${args[@]}" || true
-
-      - name: Show summary
-        if: always()
-        run: |
-          summary=$(find reports -name summary.md -type f 2>/dev/null | head -1)
-          if [ -n "$summary" ]; then
-            cat "$summary" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "⚠️ No summary.md generated" >> "$GITHUB_STEP_SUMMARY"
-          fi
 
       - name: Upload reports
         if: always()

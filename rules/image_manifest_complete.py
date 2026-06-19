@@ -19,15 +19,15 @@ from pathlib import Path
 
 try:
     from rules.common import (
-        Finding, RuleResult, get_tracked_files, is_in_production_scope,
-        is_yaml_in_production_scope, SKIP_DIRS,
-        find_params_env_dirs,
+        Finding, RuleResult, get_tracked_files, is_file_in_production_scope,
+        SKIP_DIRS, find_params_env_dirs, build_overlay_file_map,
+        is_non_production_overlay_file,
     )
 except ModuleNotFoundError:
     from common import (
-        Finding, RuleResult, get_tracked_files, is_in_production_scope,
-        is_yaml_in_production_scope, SKIP_DIRS,
-        find_params_env_dirs,
+        Finding, RuleResult, get_tracked_files, is_file_in_production_scope,
+        SKIP_DIRS, find_params_env_dirs, build_overlay_file_map,
+        is_non_production_overlay_file,
     )
 
 IMAGE_REF_PATTERN = re.compile(
@@ -187,10 +187,16 @@ def normalize_image(ref: str) -> str:
     return ref
 
 
+
+
+
 def scan_for_image_refs(
     repo_root: Path,
     tracked: set[Path] | None = None,
     params_env_dirs: set[Path] | None = None,
+    files_checked: list[str] | None = None,
+    production_scope=None,
+    non_image_prefixes: list[str] | None = None,
 ) -> list[tuple[Path, int, str]]:
     """Scan source files for container image references."""
     extensions = {".go", ".py", ".yaml", ".yml", ".json", ".sh"}
@@ -205,11 +211,16 @@ def scan_for_image_refs(
             continue
         if filepath.suffix not in extensions and filepath.name != "Dockerfile":
             continue
+        if is_file_in_production_scope(filepath, production_scope) is False:
+            continue
 
         try:
             lines = filepath.read_text().splitlines()
         except (OSError, UnicodeDecodeError):
             continue
+
+        if files_checked is not None:
+            files_checked.append(str(filepath.relative_to(repo_root)))
 
         for i, line in enumerate(lines, 1):
             stripped = line.strip()
@@ -227,6 +238,7 @@ def scan_for_image_refs(
                         and domain not in NON_REGISTRY_DOMAINS
                         and img not in seen
                         and all(len(p.split(":")[0]) > 1 for p in parts)
+                        and not (non_image_prefixes and any(img.startswith(p) for p in non_image_prefixes))
                     ):
                         seen.add(img)
                         results.append((filepath, i, img))
@@ -239,6 +251,8 @@ def check_env_var_pattern(
     manifest_env_vars: set[str] | None = None,
     tracked: set[Path] | None = None,
     production_scope=None,
+    arch_data: dict | None = None,
+    non_image_prefixes: list[str] | None = None,
 ) -> RuleResult:
     """Check repos that use RELATED_IMAGE_* env var pattern.
 
@@ -246,6 +260,7 @@ def check_env_var_pattern(
     the target repo's env vars against the authoritative operator manifest.
     """
     result = RuleResult(rule="image-manifest-complete")
+    overlay_file_map = build_overlay_file_map(arch_data, repo_root)
     var_locations = extract_related_image_vars(repo_root, with_locations=True)
     local_vars = set(var_locations.keys())
 
@@ -270,7 +285,7 @@ def check_env_var_pattern(
         ))
 
     pe_dirs = find_params_env_dirs(repo_root)
-    image_refs = scan_for_image_refs(repo_root, tracked=tracked, params_env_dirs=pe_dirs)
+    image_refs = scan_for_image_refs(repo_root, tracked=tracked, params_env_dirs=pe_dirs, files_checked=result.files_checked, production_scope=production_scope, non_image_prefixes=non_image_prefixes)
     file_lines_cache: dict[Path, list[str]] = {}
 
     dirs_with_refs: set[Path] = set()
@@ -303,10 +318,6 @@ def check_env_var_pattern(
     )
 
     for filepath, line_num, image in image_refs:
-        in_prod_go = is_in_production_scope(filepath, production_scope)
-        in_prod_yaml = is_yaml_in_production_scope(filepath, production_scope)
-        in_prod = False if (in_prod_go is False or in_prod_yaml is False) else None
-
         try:
             line_content = file_lines_cache[filepath][line_num - 1]
         except (IndexError, KeyError):
@@ -342,9 +353,9 @@ def check_env_var_pattern(
                 severity = "blocker"
                 msg = (f"Image '{image}' has no RELATED_IMAGE_* mapping on this line. "
                        f"Will not be mirrored in disconnected environments.")
-                if in_prod is False and severity == "blocker":
+                if is_non_production_overlay_file(filepath, production_scope, overlay_file_map):
                     severity = "info"
-                    msg += " [out of production scope]"
+                    msg += " [non-production overlay]"
                 if severity == "blocker":
                     result.passed = False
                 result.findings.append(Finding(
@@ -362,9 +373,9 @@ def check_env_var_pattern(
                     msg = (f"Image references '{var_name}' which does not exist "
                            f"in the operator manifest. The operator will not inject "
                            f"this image in disconnected environments.")
-                    if in_prod is False and severity in ("blocker", "warning"):
+                    if is_non_production_overlay_file(filepath, production_scope, overlay_file_map):
                         severity = "info"
-                        msg += " [out of production scope]"
+                        msg += " [non-production overlay]"
                     if severity == "blocker":
                         result.passed = False
                     result.findings.append(Finding(
@@ -407,9 +418,12 @@ def check_static_csv_pattern(
     repo_root: Path,
     tracked: set[Path] | None = None,
     production_scope=None,
+    arch_data: dict | None = None,
+    non_image_prefixes: list[str] | None = None,
 ) -> RuleResult:
     """Check repos that use static CSV relatedImages."""
     result = RuleResult(rule="image-manifest-complete")
+    overlay_file_map = build_overlay_file_map(arch_data, repo_root)
     related_images = extract_static_related_images(repo_root)
 
     if not related_images:
@@ -424,21 +438,18 @@ def check_static_csv_pattern(
         ))
 
     pe_dirs = find_params_env_dirs(repo_root)
-    image_refs = scan_for_image_refs(repo_root, tracked=tracked, params_env_dirs=pe_dirs)
+    image_refs = scan_for_image_refs(repo_root, tracked=tracked, params_env_dirs=pe_dirs, files_checked=result.files_checked, production_scope=production_scope, non_image_prefixes=non_image_prefixes)
 
     for filepath, line_num, image in image_refs:
         normalized = normalize_image(image)
-        in_prod_go = is_in_production_scope(filepath, production_scope)
-        in_prod_yaml = is_yaml_in_production_scope(filepath, production_scope)
-        in_prod = False if (in_prod_go is False or in_prod_yaml is False) else None
 
         if normalized and normalized not in related_images:
             relative = str(filepath.relative_to(repo_root))
             severity = "blocker"
             msg = f"Image '{image}' not found in CSV relatedImages."
-            if in_prod is False and severity in ("blocker", "warning"):
+            if is_non_production_overlay_file(filepath, production_scope, overlay_file_map):
                 severity = "info"
-                msg += " [out of production scope]"
+                msg += " [non-production overlay]"
             if severity == "blocker":
                 result.passed = False
             result.findings.append(Finding(
@@ -457,6 +468,8 @@ def check_unmanaged_images(
     manifest_env_vars: set[str],
     tracked: set[Path] | None = None,
     production_scope=None,
+    arch_data: dict | None = None,
+    non_image_prefixes: list[str] | None = None,
 ) -> RuleResult:
     """Check repos with no RELATED_IMAGE pattern but known to be operator-managed.
 
@@ -464,6 +477,7 @@ def check_unmanaged_images(
     These images will not be injected by the operator in disconnected environments.
     """
     result = RuleResult(rule="image-manifest-complete")
+    overlay_file_map = build_overlay_file_map(arch_data, repo_root)
     result.findings.append(Finding(
         severity="info",
         file="",
@@ -475,21 +489,17 @@ def check_unmanaged_images(
     ))
 
     pe_dirs = find_params_env_dirs(repo_root)
-    image_refs = scan_for_image_refs(repo_root, tracked=tracked, params_env_dirs=pe_dirs)
+    image_refs = scan_for_image_refs(repo_root, tracked=tracked, params_env_dirs=pe_dirs, files_checked=result.files_checked, production_scope=production_scope, non_image_prefixes=non_image_prefixes)
 
     for filepath, line_num, image in image_refs:
-        in_prod_go = is_in_production_scope(filepath, production_scope)
-        in_prod_yaml = is_yaml_in_production_scope(filepath, production_scope)
-        in_prod = False if (in_prod_go is False or in_prod_yaml is False) else None
-
         relative = str(filepath.relative_to(repo_root))
         severity = "blocker"
         msg = (f"Hardcoded image '{image}' has no RELATED_IMAGE_* wiring. "
                f"The operator will not inject a mirrored version in disconnected environments.")
 
-        if in_prod is False and severity in ("blocker", "warning"):
+        if is_non_production_overlay_file(filepath, production_scope, overlay_file_map):
             severity = "info"
-            msg += " [out of production scope]"
+            msg += " [non-production overlay]"
 
         if severity == "blocker":
             result.passed = False
@@ -505,7 +515,7 @@ def check_unmanaged_images(
     return result
 
 
-def run(repo_root: str, manifest_env_vars: set[str] | None = None, production_scope=None) -> RuleResult:
+def run(repo_root: str, manifest_env_vars: set[str] | None = None, production_scope=None, arch_data: dict | None = None, non_image_prefixes: list[str] | None = None, **_kwargs) -> RuleResult:
     """Run the image manifest completeness rule.
 
     When manifest_env_vars is provided, the env_var pattern check will
@@ -516,13 +526,13 @@ def run(repo_root: str, manifest_env_vars: set[str] | None = None, production_sc
     pattern = detect_image_pattern(root)
 
     if pattern == "env_var":
-        return check_env_var_pattern(root, manifest_env_vars=manifest_env_vars, tracked=tracked, production_scope=production_scope)
+        return check_env_var_pattern(root, manifest_env_vars=manifest_env_vars, tracked=tracked, production_scope=production_scope, arch_data=arch_data, non_image_prefixes=non_image_prefixes)
     elif pattern == "static_csv":
-        return check_static_csv_pattern(root, tracked=tracked, production_scope=production_scope)
+        return check_static_csv_pattern(root, tracked=tracked, production_scope=production_scope, arch_data=arch_data, non_image_prefixes=non_image_prefixes)
     elif manifest_env_vars is not None:
         return check_unmanaged_images(
             root, manifest_env_vars=manifest_env_vars,
-            tracked=tracked, production_scope=production_scope,
+            tracked=tracked, production_scope=production_scope, arch_data=arch_data, non_image_prefixes=non_image_prefixes,
         )
     else:
         result = RuleResult(rule="image-manifest-complete")

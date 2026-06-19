@@ -99,6 +99,22 @@ def check_runtime_pip_installs(filepath: Path, root: Path) -> List[Finding]:
 def run(repo_root: str, **_kwargs) -> RuleResult:
     root = Path(repo_root)
     result = RuleResult(rule="python-imports-bundled")
+    try:
+        return _run_impl(root, result)
+    except Exception as exc:
+        import traceback
+        result.passed = False
+        result.findings.append(Finding(
+            severity="blocker",
+            file="",
+            line=0,
+            image="",
+            message=f"Rule crashed: {exc}\n{traceback.format_exc()}",
+        ))
+        return result
+
+
+def _run_impl(root: Path, result: RuleResult) -> RuleResult:
     tracked = get_tracked_files(root)
 
     def _is_tracked(fp: Path) -> bool:
@@ -115,6 +131,7 @@ def run(repo_root: str, **_kwargs) -> RuleResult:
         for filepath in root.glob(pattern):
             if any(d in filepath.parts for d in SKIP_DIRS) or not _is_tracked(filepath):
                 continue
+            result.files_checked.append(str(filepath.relative_to(root)))
             for finding in check_requirements_file(filepath, root, known):
                 result.findings.append(finding)
                 if finding.severity == "blocker":
@@ -123,6 +140,7 @@ def run(repo_root: str, **_kwargs) -> RuleResult:
     for filepath in root.rglob("*.py"):
         if any(d in filepath.parts for d in SKIP_DIRS) or not _is_tracked(filepath):
             continue
+        result.files_checked.append(str(filepath.relative_to(root)))
         for finding in check_runtime_pip_installs(filepath, root):
             result.findings.append(finding)
             if finding.severity == "blocker":
@@ -133,6 +151,7 @@ def run(repo_root: str, **_kwargs) -> RuleResult:
     for filepath in setup_files + pyproject_files:
         if any(d in filepath.parts for d in SKIP_DIRS) or not _is_tracked(filepath):
             continue
+        result.files_checked.append(str(filepath.relative_to(root)))
         try:
             content = filepath.read_text()
             for match in GIT_DEP_PATTERN.finditer(content):

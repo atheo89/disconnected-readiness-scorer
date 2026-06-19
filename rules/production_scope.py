@@ -1,13 +1,8 @@
-"""Production-scope analysis for Go repositories and manifest files.
+"""Production-scope analysis using arch-analyzer original_sources.
 
-Go scope: Parses Dockerfiles to find Go build targets, then uses
-``go list -deps`` to compute the set of source files compiled into the
-production binary.
-
-Manifest scope: Uses the operator's ``get_all_manifests.sh`` to find
-which source folder contains production manifests, then walks the
-kustomize graph (or includes all helm chart files) to identify which
-YAML files are actually deployed.
+Uses arch-analyzer's ``dockerfiles[].copy_instructions[].original_sources``
+to identify production source directories, and the operator's
+``get_all_manifests.sh`` to find production manifest folders.
 """
 
 import json
@@ -21,190 +16,8 @@ try:
 except (ImportError, ModuleNotFoundError):
     from common import ProductionScope
 
-# ---------------------------------------------------------------------------
-# Dockerfile parsing
-# ---------------------------------------------------------------------------
-
-_FROM_RE = re.compile(r"^FROM\s+\S+(?:\s+AS\s+(\S+))?", re.IGNORECASE)
-_COPY_FROM_RE = re.compile(
-    r"^COPY\s+--from=(\S+)\s+", re.IGNORECASE,
-)
-_RUN_GO_BUILD_RE = re.compile(
-    r"go\s+build\b.*?(\.(?:/\S+)?)", re.IGNORECASE,
-)
-
-
-def _join_continuations(lines: list[str]) -> list[str]:
-    """Merge backslash-continued lines."""
-    merged: list[str] = []
-    buf = ""
-    for line in lines:
-        stripped = line.rstrip()
-        if stripped.endswith("\\"):
-            buf += stripped[:-1] + " "
-        else:
-            buf += stripped
-            merged.append(buf)
-            buf = ""
-    if buf:
-        merged.append(buf)
-    return merged
-
-
-def _parse_dockerfile(path: Path) -> list[str]:
-    """Return all Go build packages from *path*.
-
-    Scans for ``RUN go build ... ./cmd/foo`` in all stages, collecting every
-    unique package target found.
-    """
-    try:
-        raw_lines = path.read_text().splitlines()
-    except OSError:
-        return []
-
-    lines = _join_continuations(raw_lines)
-
-    packages: list[str] = []
-    seen: set[str] = set()
-
-    stage_idx = -1
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-
-        m_from = _FROM_RE.match(stripped)
-        if m_from:
-            stage_idx += 1
-            continue
-
-        if stripped.upper().startswith("RUN "):
-            for m_build in _RUN_GO_BUILD_RE.finditer(stripped):
-                pkg = m_build.group(1)
-                if stage_idx >= 0 and pkg not in seen:
-                    seen.add(pkg)
-                    packages.append(pkg)
-
-    return packages
-
-
-# ---------------------------------------------------------------------------
-# Dockerfile discovery
-# ---------------------------------------------------------------------------
-
-_DOCKERFILE_NAMES = {"Dockerfile", "Containerfile"}
+# Extended skip set for scope computation — testdata/docs are never production code.
 _SKIP_DIRS = {".git", "vendor", "node_modules", "__pycache__", "testdata", "docs"}
-
-
-def _find_all_dockerfiles(repo_root: Path) -> list[Path]:
-    """Return all Dockerfiles in the repo, sorted by relevance (root first)."""
-    found: list[Path] = []
-    for filepath in repo_root.rglob("*"):
-        if any(d in filepath.parts for d in _SKIP_DIRS):
-            continue
-        if filepath.name in _DOCKERFILE_NAMES or filepath.name.endswith(".Dockerfile"):
-            found.append(filepath)
-
-    def _sort_key(p: Path) -> tuple:
-        depth = len(p.relative_to(repo_root).parts)
-        return (depth, str(p))
-
-    return sorted(found, key=_sort_key)
-
-
-# ---------------------------------------------------------------------------
-# Go entrypoint heuristic
-# ---------------------------------------------------------------------------
-
-
-def _find_go_entrypoints_heuristic(repo_root: Path) -> list[tuple[str, Path]]:
-    """Find ``cmd/*/main.go`` patterns, including in subdirectories.
-
-    Returns list of ``(package_path, go_mod_dir)`` tuples.
-    """
-    results: list[tuple[str, Path]] = []
-    for main_go in sorted(repo_root.rglob("main.go")):
-        if any(d in main_go.parts for d in _SKIP_DIRS):
-            continue
-        parent = main_go.parent
-        if parent.name == "cmd" or (parent.parent and parent.parent.name == "cmd"):
-            go_mod_dir = _find_go_mod_dir(main_go)
-            if go_mod_dir is None:
-                continue
-            rel = str(parent.relative_to(go_mod_dir))
-            pkg = f"./{rel}" if not rel.startswith(".") else rel
-            results.append((pkg, go_mod_dir))
-    return results
-
-
-def _find_go_mod_dir(filepath: Path) -> Optional[Path]:
-    """Walk up from *filepath* to find the nearest ``go.mod``."""
-    current = filepath.parent
-    while current != current.parent:
-        if (current / "go.mod").is_file():
-            return current
-        current = current.parent
-    return None
-
-
-# ---------------------------------------------------------------------------
-# go list -deps
-# ---------------------------------------------------------------------------
-
-
-def _go_list_deps(repo_root: Path, package: str) -> Optional[set[Path]]:
-    """Run ``go list -deps -json <package>`` and collect production ``.go`` files."""
-    try:
-        result = subprocess.run(
-            ["go", "list", "-deps", "-json", package],
-            capture_output=True, text=True, timeout=60,
-            cwd=str(repo_root),
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return None
-
-    if result.returncode != 0:
-        return None
-
-    production_files: set[Path] = set()
-    repo_resolved = repo_root.resolve()
-
-    for obj in _iter_json_objects(result.stdout):
-        pkg_dir = obj.get("Dir")
-        if not pkg_dir:
-            continue
-
-        pkg_path = Path(pkg_dir).resolve()
-        try:
-            pkg_path.relative_to(repo_resolved)
-        except ValueError:
-            continue
-
-        for fname in obj.get("GoFiles", []):
-            production_files.add((pkg_path / fname).resolve())
-        for fname in obj.get("CgoFiles", []):
-            production_files.add((pkg_path / fname).resolve())
-
-    return production_files if production_files else None
-
-
-def _iter_json_objects(text: str):
-    """Yield decoded JSON objects from a concatenated JSON stream."""
-    decoder = json.JSONDecoder()
-    idx = 0
-    length = len(text)
-    while idx < length:
-        while idx < length and text[idx] in " \t\r\n":
-            idx += 1
-        if idx >= length:
-            break
-        try:
-            obj, end = decoder.raw_decode(text, idx)
-            yield obj
-            idx = end
-        except json.JSONDecodeError:
-            break
-
 
 # ---------------------------------------------------------------------------
 # Manifest (kustomize / helm) scope
@@ -263,13 +76,24 @@ _GO_EMBED_RE = re.compile(r'//go:embed\s+(.+)')
 
 def _collect_go_embedded_yamls(
     repo_root: Path,
-    production_go_files: Optional[set[Path]],
+    production_dirs: Optional[set[Path]],
 ) -> set[Path]:
-    """Find YAML files referenced by ``//go:embed`` in production Go files."""
-    if not production_go_files:
+    """Find YAML files referenced by ``//go:embed`` in production .go files."""
+    if not production_dirs:
         return set()
 
     embedded: set[Path] = set()
+
+    # Collect all .go files under production_dirs
+    production_go_files: set[Path] = set()
+    for prod_dir in production_dirs:
+        for dirpath, dirnames, filenames in prod_dir.walk():
+            # Skip subdirs in-place
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+            for fname in filenames:
+                if fname.endswith(".go"):
+                    production_go_files.add((dirpath / fname).resolve())
+
     for go_file in production_go_files:
         try:
             content = go_file.read_text()
@@ -333,6 +157,230 @@ def collect_manifest_scope_files(source_dir: Path) -> Optional[set[Path]]:
 
 
 # ---------------------------------------------------------------------------
+# arch-analyzer original_sources
+# ---------------------------------------------------------------------------
+
+
+_DOCKER_ARG_RE = re.compile(r'\$\{[^}]+\}')
+
+
+def _is_glob_source(source_stripped: str) -> bool:
+    """True if source contains ** wildcards or unresolved ${VAR} tokens."""
+    return "**" in source_stripped or bool(_DOCKER_ARG_RE.search(source_stripped))
+
+
+def _normalize_glob(source_stripped: str) -> str:
+    """Convert ${VAR} tokens to ** for globbing (arch-analyzer may do this already)."""
+    return _DOCKER_ARG_RE.sub("**", source_stripped)
+
+
+def _glob_source(source_stripped: str, repo_root: Path, resolved_root: Path) -> list[Path]:
+    """Glob a source pattern containing ** or ${VAR} tokens.
+
+    Returns empty list if the pattern is too broad (pure **) or matches nothing.
+    """
+    glob_pat = _normalize_glob(source_stripped)
+    if glob_pat == "**":
+        return []
+    results = []
+    for match in repo_root.glob(glob_pat):
+        resolved = match.resolve()
+        if resolved != resolved_root:
+            results.append(match)
+    return results
+
+
+def _find_go_module_dir(all_sources: list[str], repo_root: Path) -> Optional[Path]:
+    """Find the Go module root by locating go.mod via glob across all sources."""
+    for s in all_sources:
+        pat = _normalize_glob(s.strip("/"))
+        if "go.mod" not in pat:
+            continue
+        for match in repo_root.glob(pat):
+            if match.is_file() and match.name == "go.mod":
+                return match.parent.resolve()
+    return None
+
+
+def _go_list_production_dirs(module_dir: Path) -> set[Path]:
+    """Run go list -deps -json ./... and return set of source directories."""
+    try:
+        result = subprocess.run(
+            ["go", "list", "-deps", "-json", "./..."],
+            cwd=module_dir, capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            return set()
+        raw = result.stdout.strip()
+        if not raw:
+            return set()
+        # go list outputs multiple JSON objects; wrap into array
+        raw_array = "[" + raw.replace("}\n{", "},\n{") + "]"
+        packages = json.loads(raw_array)
+        dirs: set[Path] = set()
+        for pkg in packages:
+            if pkg.get("Standard"):
+                continue
+            pkg_dir = pkg.get("Dir")
+            if pkg_dir:
+                dirs.add(Path(pkg_dir).resolve())
+        return dirs
+    except Exception:
+        return set()
+
+
+def _nearest_package_json_dir(dockerfile_dir: Path, repo_root: Path) -> Path:
+    """Walk up from dockerfile_dir to find nearest package.json (before repo_root)."""
+    current = dockerfile_dir.resolve()
+    resolved_root = repo_root.resolve()
+    while current != resolved_root and current != current.parent:
+        if (current / "package.json").exists():
+            return current
+        current = current.parent
+    return dockerfile_dir.resolve()
+
+
+def _is_js_monorepo(repo_root: Path) -> bool:
+    """True if repo root has a package.json with a workspaces field."""
+    pkg_json = repo_root / "package.json"
+    if not pkg_json.exists():
+        return False
+    try:
+        data = json.loads(pkg_json.read_text())
+        return bool(data.get("workspaces"))
+    except Exception:
+        return False
+
+
+def _extract_production_sources_from_arch_data(
+    arch_data: dict, repo_root: Path,
+    docker_contexts: Optional[dict] = None,
+) -> tuple[set[Path], set[Path], set[Path], list[str]]:
+    """Extract production sources from arch-analyzer dockerfiles.
+
+    Handles three source cases in order:
+    1. Sources with ``${VAR}`` tokens — resolved by replacing with ``**`` glob.
+    2. Sources resolving to repo_root (e.g. ``COPY . .``) — scoped via Go/JS heuristics.
+    3. Literal paths — resolved directly.
+
+    Returns:
+        production_dirs: resolved directory paths
+        production_files: resolved individual file paths
+        manifest_dirs: resolved directory paths with manifest_hint=true
+        manifest_source_folders: folder names (str) for manifest sources
+    """
+    production_dirs: set[Path] = set()
+    production_files: set[Path] = set()
+    manifest_dirs: set[Path] = set()
+    manifest_source_folders: list[str] = []
+    resolved_root = repo_root.resolve()
+    js_monorepo = _is_js_monorepo(repo_root)
+    docker_contexts = docker_contexts or {}
+
+    for dockerfile in arch_data.get("dockerfiles", []):
+        dockerfile_path = dockerfile.get("path", "")
+        dockerfile_dir = (repo_root / dockerfile_path).parent
+
+        # Try build_commands entry_points first (arch-analyzer may provide these)
+        entry_points = []
+        for bc in dockerfile.get("build_commands", []):
+            ep = bc.get("entry_point", "")
+            if ep:
+                entry_points.append(ep)
+
+        resolved_entry_points = False
+        if entry_points:
+            for ep in entry_points:
+                ep_path = repo_root / ep.strip("./")
+                if ep_path.is_dir():
+                    production_dirs.add(ep_path.resolve())
+                    resolved_entry_points = True
+                elif ep_path.is_file():
+                    production_files.add(ep_path.resolve())
+                    resolved_entry_points = True
+        has_entry_points = resolved_entry_points
+
+        # Collect all original_sources across all copy instructions for this Dockerfile
+        all_sources: list[str] = [
+            s
+            for ci in dockerfile.get("copy_instructions", [])
+            for s in ci.get("original_sources", [])
+        ]
+
+        for copy_instr in dockerfile.get("copy_instructions", []):
+            original_sources = copy_instr.get("original_sources", [])
+            is_manifest = copy_instr.get("manifest_hint", False)
+
+            for source in original_sources:
+                source_stripped = source.strip("/")
+
+                # Case 1: source contains ** or ${VAR} — resolve via glob
+                if _is_glob_source(source_stripped):
+                    for match in _glob_source(source_stripped, repo_root, resolved_root):
+                        resolved = match.resolve()
+                        if is_manifest:
+                            if match.is_dir():
+                                manifest_dirs.add(resolved)
+                                if match.parent.resolve() == resolved_root:
+                                    manifest_source_folders.append(match.name)
+                        elif not has_entry_points:
+                            if match.is_dir():
+                                production_dirs.add(resolved)
+                            elif match.is_file():
+                                production_files.add(resolved)
+                    continue
+
+                source_path = repo_root / source_stripped
+
+                # Case 2: source resolves to repo_root — apply scoping heuristics
+                if source_path.resolve() == resolved_root and not is_manifest:
+                    if has_entry_points:
+                        continue
+
+                    # Config override: explicit context for this Dockerfile
+                    if dockerfile_path in docker_contexts:
+                        ctx_dir = repo_root / docker_contexts[dockerfile_path]
+                        if ctx_dir.is_dir():
+                            production_dirs.add(ctx_dir.resolve())
+                        continue
+
+                    # Heuristic A: Go Dockerfile → go list -deps
+                    go_module_dir = _find_go_module_dir(all_sources, repo_root)
+                    if go_module_dir:
+                        go_dirs = _go_list_production_dirs(go_module_dir)
+                        production_dirs.update(go_dirs)
+                        continue
+
+                    # Heuristic B: JS monorepo → nearest package.json
+                    if js_monorepo:
+                        pkg_dir = _nearest_package_json_dir(dockerfile_dir, repo_root)
+                        if pkg_dir.resolve() != resolved_root:
+                            production_dirs.add(pkg_dir.resolve())
+                    continue
+
+                # Case 3: literal path
+                if source_path.is_dir():
+                    resolved = source_path.resolve()
+                    if resolved == resolved_root:
+                        continue  # skip bare repo root without heuristic context
+                    if is_manifest:
+                        manifest_dirs.add(resolved)
+                        if source_path.parent.resolve() == resolved_root:
+                            manifest_source_folders.append(source_path.name)
+                    elif not has_entry_points:
+                        production_dirs.add(resolved)
+                elif source_path.is_file():
+                    resolved = source_path.resolve()
+                    if is_manifest:
+                        manifest_dirs.add(source_path.parent.resolve())
+                    elif not has_entry_points:
+                        production_files.add(resolved)
+
+    manifest_source_folders = sorted(set(manifest_source_folders))
+    return production_dirs, production_files, manifest_dirs, manifest_source_folders
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -341,8 +389,10 @@ def compute_production_scope(
     repo_root: Path,
     manifest_source_folders: Optional[list] = None,
     overlay_paths: Optional[list] = None,
+    arch_data: Optional[dict] = None,
+    docker_contexts: Optional[dict] = None,
 ) -> Optional[ProductionScope]:
-    """Compute the production file scope for a repository.
+    """Compute the production file scope for a repository using arch-analyzer.
 
     *manifest_source_folders* is an optional list of relative directories
     (e.g. ``["config"]``) containing production manifests.  When provided,
@@ -352,48 +402,28 @@ def compute_production_scope(
     manifest source folder) that the operator actually deploys.  Passed
     through to ``ProductionScope`` for use by ``params_env``.
 
-    Returns ``None`` only when neither Go scope nor manifest scope can be
-    determined.
+    *arch_data* is architecture data from arch-analyzer. Uses
+    ``dockerfiles[].copy_instructions[].original_sources`` for production scope.
+
+    Returns ``None`` when neither production dirs nor manifest scope can be determined.
     """
     repo_root = Path(repo_root)
 
-    # --- Go scope (all Dockerfiles + heuristic entrypoints) ---
+    production_dirs: Optional[set[Path]] = None
     production_files: Optional[set[Path]] = None
-    seen_entrypoints: set[tuple[str, str]] = set()
+    method = ""
 
-    is_go_repo = (repo_root / "go.mod").exists()
-
-    dockerfiles = _find_all_dockerfiles(repo_root) if is_go_repo else []
-    for dockerfile in dockerfiles:
-        packages = _parse_dockerfile(dockerfile)
-        if not packages:
-            continue
-        go_mod_dir = _find_go_mod_dir(dockerfile)
-        if go_mod_dir is None:
-            go_mod_dir = repo_root
-        for pkg in packages:
-            key = (pkg, str(go_mod_dir))
-            if key in seen_entrypoints:
-                continue
-            seen_entrypoints.add(key)
-
-            deps = _go_list_deps(go_mod_dir, pkg)
-            if deps:
-                if production_files is None:
-                    production_files = set()
-                production_files.update(deps)
-
-    for pkg, go_mod_dir in (_find_go_entrypoints_heuristic(repo_root) if is_go_repo else []):
-        key = (pkg, str(go_mod_dir))
-        if key in seen_entrypoints:
-            continue
-        seen_entrypoints.add(key)
-
-        deps = _go_list_deps(go_mod_dir, pkg)
-        if deps:
-            if production_files is None:
-                production_files = set()
-            production_files.update(deps)
+    # --- arch-analyzer original_sources ---
+    if arch_data:
+        arch_prod_dirs, arch_prod_files, arch_manifest_dirs, arch_manifest_folders = (
+            _extract_production_sources_from_arch_data(arch_data, repo_root, docker_contexts=docker_contexts)
+        )
+        if arch_prod_dirs or arch_prod_files:
+            production_dirs = arch_prod_dirs or None
+            production_files = arch_prod_files or None
+            method = "arch-analyzer-original-sources"
+        if arch_manifest_folders and not manifest_source_folders:
+            manifest_source_folders = arch_manifest_folders
 
     # --- Manifest scope ---
     manifest_files: Optional[set[Path]] = None
@@ -411,19 +441,23 @@ def compute_production_scope(
             manifest_files = all_manifest_files
 
     # --- Go-embedded YAMLs ---
-    embedded_yamls = _collect_go_embedded_yamls(repo_root, production_files)
+    embedded_yamls = _collect_go_embedded_yamls(repo_root, production_dirs)
     if embedded_yamls:
         if manifest_files is None:
             manifest_files = set()
         manifest_files.update(embedded_yamls)
 
-    if production_files is None and manifest_files is None:
+    if production_dirs is None and production_files is None and manifest_files is None:
         return None
 
+    if not method:
+        method = "manifest-only"
+
     return ProductionScope(
-        production_files=production_files or set(),
-        method="go-import-graph" if production_files else "manifest-only",
+        method=method,
         manifest_files=manifest_files,
         manifest_source=manifest_source_str,
         overlay_paths=overlay_paths,
+        production_dirs=production_dirs,
+        production_files=production_files,
     )

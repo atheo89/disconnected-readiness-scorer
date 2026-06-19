@@ -26,6 +26,7 @@ KNOWN_ISSUES_PATTERN = re.compile(r'- image:\s*(RELATED_IMAGE_[A-Z0-9_]+)')
 OPERATOR_REPO = "https://github.com/opendatahub-io/opendatahub-operator.git"
 COMPONENTS_PATH = "internal/controller/components"
 
+# Minimal skip set for the operator repo (no .tox/.devcontainer present).
 SKIP_DIRS = {".git", "vendor", "node_modules", "__pycache__"}
 TEST_SUFFIXES = {"_test.go", "_int_test.go", "_internal_test.go"}
 
@@ -44,7 +45,6 @@ class Manifest:
     images: list = field(default_factory=list)
     components: dict = field(default_factory=dict)
     known_issues: list = field(default_factory=list)
-    rhai_helm_components: list = field(default_factory=list)
 
 
 _MANIFEST_ENTRY_RE = re.compile(
@@ -52,51 +52,40 @@ _MANIFEST_ENTRY_RE = re.compile(
 )
 
 
-def parse_component_manifest_mapping(operator_path: str) -> Dict[str, List[str]]:
-    """Parse get_all_manifests.sh to build repo-name → source-folders mapping.
+def parse_manifest_entries(operator_path: str) -> Tuple[Dict[str, List[str]], Dict[str, str]]:
+    """Parse get_all_manifests.sh → (repo→source_folders, repo→component_key).
 
-    Parses both ODH_COMPONENT_MANIFESTS and ODH_COMPONENT_CHARTS arrays.
-    Returns e.g. ``{'kserve': ['config'], 'odh-dashboard': ['manifests']}``.
+    Parses ODH_COMPONENT_MANIFESTS, ODH_COMPONENT_CHARTS, and ODH_CCM_CHARTS arrays
+    in a single pass (regex matches entry format, not array name).
+    Returns tuple of:
+    - repo→source_folders: e.g. ``{'kserve': ['config'], 'odh-dashboard': ['manifests']}``
+    - repo→component_key: e.g. ``{'kserve': 'kserve', 'kubeflow': 'workbenches/kf-notebook-controller'}``
     """
     script = Path(operator_path) / "get_all_manifests.sh"
     if not script.is_file():
-        return {}
+        return {}, {}
 
     try:
         content = script.read_text()
     except (OSError, UnicodeDecodeError):
-        return {}
+        return {}, {}
 
-    mapping: Dict[str, List[str]] = {}
-    for match in _MANIFEST_ENTRY_RE.finditer(content):
-        repo_name = match.group(3)
-        source_folder = match.group(5)
-        mapping.setdefault(repo_name, [])
-        if source_folder not in mapping[repo_name]:
-            mapping[repo_name].append(source_folder)
+    source_folders: Dict[str, List[str]] = {}
+    component_keys: Dict[str, str] = {}
 
-    return mapping
-
-
-def parse_repo_component_key(operator_path: str) -> Dict[str, str]:
-    """Parse get_all_manifests.sh to build repo-name → component-key mapping.
-
-    Returns e.g. ``{'kserve': 'kserve', 'kubeflow': 'workbenches/kf-notebook-controller'}``.
-    """
-    script = Path(operator_path) / "get_all_manifests.sh"
-    if not script.is_file():
-        return {}
-    try:
-        content = script.read_text()
-    except (OSError, UnicodeDecodeError):
-        return {}
-
-    mapping: Dict[str, str] = {}
     for match in _MANIFEST_ENTRY_RE.finditer(content):
         component_key = match.group(1)
         repo_name = match.group(3)
-        mapping.setdefault(repo_name, component_key)
-    return mapping
+        source_folder = match.group(5)
+
+        source_folders.setdefault(repo_name, [])
+        if source_folder not in source_folders[repo_name]:
+            source_folders[repo_name].append(source_folder)
+
+        component_keys.setdefault(repo_name, component_key)
+
+    return source_folders, component_keys
+
 
 
 _COMPONENT_DIR_MAP = {
@@ -105,108 +94,49 @@ _COMPONENT_DIR_MAP = {
 
 _SKIP_OVERLAY_COMPONENTS = {'operator'}
 
-_PLATFORM_PRIORITY = ['SelfManagedRhoai', 'ManagedRhoai', 'OpenDataHub']
+
+def _get_component_dir(component_key: str) -> str:
+    """Map component key to operator component directory name."""
+    if '/' in component_key:
+        return component_key.split('/')[0]
+    return _COMPONENT_DIR_MAP.get(component_key, component_key)
 
 
-def _parse_overlay_paths(content: str) -> Dict[str, str]:
-    """Extract overlay/source paths from operator Go source.
-
-    Adapted from architecture-context/lib/kustomize_context.py.
-    """
-    overlay_paths: Dict[str, str] = {}
-
-    # Pattern 1: map[common.Platform]string with platform keys
-    map_pattern = r'(\w+)\s*=\s*map\[(?:common\.)?Platform\]string\s*\{(.*?)\}'
-    for map_match in re.finditer(map_pattern, content, re.DOTALL):
-        var_name = map_match.group(1)
-        map_body = map_match.group(2)
-        entry_pattern = (
-            r'cluster\.(SelfManagedRhoai|ManagedRhoai'
-            r'|OpenDataHub)\s*:\s*"([^"]*)"'
-        )
-        entries = {
-            m.group(1): m.group(2)
-            for m in re.finditer(entry_pattern, map_body)
-        }
-        if not entries:
-            continue
-        if all(' ' in v for v in entries.values()):
-            continue
-        for platform, path in entries.items():
-            key = f"{var_name}:{platform}"
-            overlay_paths[key] = path.lstrip('/')
-
-    # Pattern 2: named const/var with path value
-    const_pattern = r'(\w*(?:Manifest|Source)\w*Path\w*)\s*=\s*"([^"]*)"'
-    for match in re.finditer(const_pattern, content):
-        name = match.group(1)
-        path = match.group(2).lstrip('/')
-        if name not in overlay_paths:
-            overlay_paths[name] = path
-
-    # Pattern 3 (fallback): SourcePath: "literal" in struct literals
-    if not overlay_paths:
-        struct_pattern = r'SourcePath:\s*"([^"]+)"'
-        for match in re.finditer(struct_pattern, content):
-            path = match.group(1).lstrip('/')
-            overlay_paths['default'] = path
-            break
-
-    return overlay_paths
-
-
-def parse_component_overlay_paths(
-    operator_path: str, component_key: str,
+def parse_overlay_paths_from_arch_data(
+    arch_data: dict, component_key: str,
 ) -> List[str]:
-    """Extract deployed overlay paths for a component from operator Go source.
+    """Extract deployed overlay paths from arch-analyzer kustomize_components.
 
-    Returns a deduplicated list of overlay paths, prioritising RHOAI platforms.
+    Reads ``overlay_paths`` from the operator's component-architecture.json
+    ``kustomize_components`` section.
+    Returns a deduplicated list of paths.
     """
     if component_key in _SKIP_OVERLAY_COMPONENTS:
         return []
 
-    if '/' in component_key:
-        dir_name = component_key.split('/')[0]
-    else:
-        dir_name = _COMPONENT_DIR_MAP.get(component_key, component_key)
+    dir_name = _get_component_dir(component_key)
 
-    component_dir = (
-        Path(operator_path) / "internal" / "controller"
-        / "components" / dir_name
-    )
-    if not component_dir.exists():
-        return []
-
-    content = ""
-    for go_file in sorted(component_dir.glob("*.go")):
-        if go_file.name.endswith("_test.go"):
+    for comp in arch_data.get("kustomize_components", []):
+        source = comp.get("support_file", "")
+        parts = source.split("/")
+        if "components" not in parts:
             continue
-        try:
-            content += go_file.read_text() + "\n"
-        except (OSError, UnicodeDecodeError):
+        idx = parts.index("components")
+        if idx + 1 >= len(parts) or parts[idx + 1] != dir_name:
             continue
 
-    if not content:
-        return []
+        raw_paths = comp.get("overlay_paths", [])
+        if not raw_paths:
+            return []
 
-    raw = _parse_overlay_paths(content)
-    if not raw:
-        return []
-
-    # Deduplicate and prioritise by platform
-    seen = set()
-    result: List[str] = []
-    for platform in _PLATFORM_PRIORITY:
-        for key, path in raw.items():
-            if platform in key and path not in seen:
-                seen.add(path)
+        result: List[str] = []
+        for path in raw_paths:
+            path = path.strip("/")
+            if path and path not in result:
                 result.append(path)
-    for path in raw.values():
-        if path not in seen:
-            seen.add(path)
-            result.append(path)
+        return result
 
-    return result
+    return []
 
 
 def clone_operator(target_dir: Path) -> Path:
@@ -261,43 +191,36 @@ def parse_component_images(component_dir: Path, component_name: str) -> List[Ima
     return entries
 
 
-def parse_known_issues(operator_root: Path) -> Tuple[List[str], List[str]]:
-    """Parse component-params-env.yaml for known issues and helm components."""
+def parse_known_issues(operator_root: Path) -> List[str]:
+    """Parse component-params-env.yaml for known issues."""
     params_file = operator_root / "component-params-env.yaml"
     known_issues = []
-    rhai_helm = []
 
     if not params_file.exists():
-        return known_issues, rhai_helm
+        return known_issues
 
     try:
         content = params_file.read_text()
     except (OSError, UnicodeDecodeError):
-        return known_issues, rhai_helm
+        return known_issues
 
     in_known_issues = False
-    in_rhai_helm = False
 
     for line in content.splitlines():
         stripped = line.strip()
 
         if stripped.startswith("# known_issues:"):
             in_known_issues = True
-            in_rhai_helm = False
-            continue
-        if stripped.startswith("# rhai_helm_components:"):
-            in_rhai_helm = True
-            in_known_issues = False
             continue
         if stripped.startswith("#") and not stripped.startswith("# -"):
             in_known_issues = False
-            in_rhai_helm = False
 
-        match = KNOWN_ISSUES_PATTERN.match(stripped)
-        if match:
-            known_issues.append(match.group(1))
+        if in_known_issues:
+            match = KNOWN_ISSUES_PATTERN.match(stripped)
+            if match:
+                known_issues.append(match.group(1))
 
-    return known_issues, rhai_helm
+    return known_issues
 
 
 def build_manifest(operator_root: Union[str, Path]) -> Manifest:
@@ -353,9 +276,7 @@ def build_manifest(operator_root: Union[str, Path]) -> Manifest:
                         source_line=i,
                     ))
 
-    known_issues, rhai_helm = parse_known_issues(root)
-    manifest.known_issues = known_issues
-    manifest.rhai_helm_components = rhai_helm
+    manifest.known_issues = parse_known_issues(root)
 
     return manifest
 

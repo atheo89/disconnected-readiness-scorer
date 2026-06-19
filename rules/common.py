@@ -1,8 +1,13 @@
 import subprocess
-import sys
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Optional
+
+
+class Severity(str, Enum):
+    BLOCKER = "blocker"
+    INFO = "info"
 
 
 @dataclass
@@ -13,37 +18,33 @@ class Finding:
     image: str
     message: str
 
+    def __post_init__(self):
+        if isinstance(self.severity, str) and not isinstance(self.severity, Severity):
+            try:
+                self.severity = Severity(self.severity)
+            except ValueError:
+                raise ValueError(
+                    f"Invalid severity '{self.severity}'. "
+                    f"Must be one of: {[s.value for s in Severity]}"
+                )
+
 
 @dataclass
 class RuleResult:
     rule: str
     passed: bool = True
     findings: list[Finding] = field(default_factory=list)
+    files_checked: list[str] = field(default_factory=list)
 
 
 @dataclass
 class ProductionScope:
-    production_files: set  # resolved absolute Paths of production .go files
-    method: str            # e.g. "go-import-graph"
+    method: str            # e.g. "arch-analyzer-original-sources"
     manifest_files: Optional[set] = None  # resolved YAML paths in kustomize/helm graph
     manifest_source: Optional[str] = None  # e.g. "config" (source folder)
     overlay_paths: Optional[list] = None   # operator-deployed overlay dirs
-
-
-def is_in_production_scope(filepath: Path, production_scope: Optional[ProductionScope]) -> Optional[bool]:
-    """Check whether a ``.go`` file is inside the production scope.
-
-    Returns True (in scope), False (out of scope), or None (unknown / scope
-    not computed).  Only ``.go`` files are evaluated; all other extensions
-    return None so that existing rule logic handles them.
-    """
-    if production_scope is None:
-        return None
-    if not str(filepath).endswith(".go"):
-        return None
-    if not production_scope.production_files:
-        return None
-    return filepath.resolve() in production_scope.production_files
+    production_dirs: Optional[set] = None  # resolved dirs from original_sources (all file types)
+    production_files: Optional[set] = None # resolved individual file paths (e.g. go.mod at repo root)
 
 
 def is_yaml_in_production_scope(filepath: Path, production_scope: Optional[ProductionScope]) -> Optional[bool]:
@@ -60,6 +61,85 @@ def is_yaml_in_production_scope(filepath: Path, production_scope: Optional[Produ
     return filepath.resolve() in production_scope.manifest_files
 
 
+def is_file_in_production_scope(filepath: Path, production_scope: Optional[ProductionScope]) -> Optional[bool]:
+    """Check whether ANY file type is inside the production scope.
+
+    Returns True (in scope), False (out of scope), or None (unknown / scope not computed).
+
+    Checks production_dirs (any file under a production directory) and
+    production_files (individual files like go.mod at repo root).
+    """
+    if production_scope is None:
+        return None
+    has_dirs = bool(production_scope.production_dirs)
+    has_files = bool(production_scope.production_files)
+    if not has_dirs and not has_files:
+        return None
+
+    resolved = filepath.resolve()
+
+    if has_files and resolved in production_scope.production_files:
+        return True
+
+    if has_dirs:
+        for prod_dir in production_scope.production_dirs:
+            try:
+                resolved.relative_to(prod_dir)
+                return True
+            except ValueError:
+                continue
+
+    return False
+
+
+def build_overlay_file_map(
+    arch_data: dict | None,
+    repo_root: Path,
+) -> dict[str, set[Path]]:
+    """Build overlay path → files map from kustomize_overlay_refs.
+
+    Returns dict mapping overlay path (e.g., 'overlays/odh') to set of resolved file paths.
+    """
+    if not arch_data:
+        return {}
+
+    overlay_map: dict[str, set[Path]] = {}
+    for ref in arch_data.get("kustomize_overlay_refs", []):
+        overlay_path = ref.get("overlay_path", "")
+        file_path = ref.get("file_path", "")
+        if overlay_path and file_path:
+            resolved = (repo_root / file_path).resolve()
+            overlay_map.setdefault(overlay_path, set()).add(resolved)
+
+    return overlay_map
+
+
+def is_non_production_overlay_file(
+    filepath: Path,
+    production_scope,
+    overlay_file_map: dict[str, set[Path]],
+) -> bool:
+    """Check if file is in a non-production overlay.
+
+    Returns True if file is in an overlay that's not in production_scope.overlay_paths.
+    """
+    if not overlay_file_map or not production_scope or not production_scope.overlay_paths:
+        return False
+
+    resolved = filepath.resolve()
+    production_overlays = set(production_scope.overlay_paths)
+
+    for overlay_path, files in overlay_file_map.items():
+        if resolved in files:
+            return overlay_path not in production_overlays
+
+    return False
+
+
+# General source-scanning exclusions. Rules scanning the target repo import this set.
+# Other modules define their own variants:
+#   - operator_manifest.py: minimal subset (operator repo has no .tox/.devcontainer)
+#   - production_scope.py: adds testdata/docs (irrelevant for production scope computation)
 SKIP_DIRS = {".git", "vendor", "node_modules", "__pycache__", ".tox", ".devcontainer"}
 
 
@@ -109,26 +189,42 @@ def _collect_kustomize_tree(overlay_dir: Path, dirs: set[Path]):
 
 
 
+CONFIG_DIR = ".disconnected-readiness"
+CONFIG_FILE = "config.yaml"
+
+
+def load_repo_config(root: Path) -> dict:
+    """Load per-repo scanner config from .disconnected-readiness/config.yaml."""
+    return load_config_file(root / CONFIG_DIR / CONFIG_FILE)
+
+
+class ConfigError(Exception):
+    """Raised when a config file exists but cannot be read or parsed."""
+
+
 def load_config_file(config_path: Path) -> dict:
-    """Load a YAML config file, returning empty dict if missing."""
+    """Load a YAML config file, returning empty dict if missing.
+
+    Raises ConfigError if the file exists but cannot be read or parsed.
+    """
     import yaml
 
     if not config_path.exists():
         return {}
     try:
         text = config_path.read_text()
-    except (OSError, UnicodeDecodeError):
-        return {}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"Cannot read {config_path}: {exc}") from exc
     try:
         result = yaml.safe_load(text)
     except yaml.YAMLError as exc:
-        print(f"  Warning: failed to parse {config_path}: {exc}", file=sys.stderr)
-        return {}
+        raise ConfigError(f"Failed to parse {config_path}: {exc}") from exc
     if result is None:
         return {}
     if not isinstance(result, dict):
-        print(f"  Warning: {config_path} must be a YAML mapping, got {type(result).__name__}", file=sys.stderr)
-        return {}
+        raise ConfigError(
+            f"{config_path} must be a YAML mapping, got {type(result).__name__}"
+        )
     return result
 
 

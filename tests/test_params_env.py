@@ -258,7 +258,7 @@ class TestManifestSourceFlow:
             "spec:\n  image: registry.io/hardcoded/image:v1\n"
         )
         scope = ProductionScope(
-            production_files=set(), method="test",
+            method="test",
             manifest_source="manifests",
         )
         with patch("rules.params_env.kustomize_available", return_value=True), \
@@ -279,7 +279,7 @@ class TestManifestSourceFlow:
         })
 
         scope = ProductionScope(
-            production_files=set(), method="test",
+            method="test",
             manifest_source="manifests",
         )
         # kustomize_build on the probed copy should return sentinel
@@ -311,7 +311,7 @@ class TestManifestSourceFlow:
             "spec:\n  image: quay.io/org/hardcoded:v2\n"
         )
         scope = ProductionScope(
-            production_files=set(), method="test",
+            method="test",
             manifest_source="manifests",
         )
         with patch("rules.params_env.kustomize_available", return_value=True), \
@@ -333,3 +333,201 @@ class TestManifestSourceFlow:
             result = run(str(tmp_path))
         assert result.rule == "params-env-wiring"
         assert any("params.env pattern" in f.message for f in result.findings)
+
+class TestKustomizeOverlayConfig:
+    def _make_repo_with_base_and_overlays(self, tmp_path):
+        """Create a repo with base dirs (placeholder images) and overlays (wired)."""
+        config_dir = tmp_path / "manifests"
+
+        base = config_dir / "manager"
+        base.mkdir(parents=True)
+        (base / "kustomization.yaml").write_text("resources: []\n")
+
+        overlay_odh = config_dir / "overlays" / "odh"
+        overlay_odh.mkdir(parents=True)
+        (overlay_odh / "params.env").write_text(
+            "IMG=quay.io/org/img@sha256:" + "a" * 64 + "\n"
+        )
+        (overlay_odh / "kustomization.yaml").write_text(
+            "resources:\n- ../../manager\n"
+        )
+
+        overlay_rhoai = config_dir / "overlays" / "rhoai"
+        overlay_rhoai.mkdir(parents=True)
+        (overlay_rhoai / "params.env").write_text(
+            "IMG=quay.io/org/img@sha256:" + "b" * 64 + "\n"
+        )
+        (overlay_rhoai / "kustomization.yaml").write_text(
+            "resources:\n- ../../manager\n"
+        )
+        return config_dir
+
+    def test_overlay_config_filters_probe_dirs(self, tmp_path):
+        """With overlay_paths on ProductionScope, only listed dirs are probed."""
+        self._make_repo_with_base_and_overlays(tmp_path)
+
+        hardcoded = (
+            "---\nkind: Deployment\nmetadata:\n  name: app\n"
+            "spec:\n  image: registry.io/hardcoded:v1\n"
+        )
+        scope = ProductionScope(
+            method="test",
+            manifest_source="manifests",
+            overlay_paths=["manifests/overlays/odh"],
+        )
+
+        build_calls = []
+
+        def tracking_build(kdir):
+            build_calls.append(str(kdir))
+            return hardcoded
+
+        with patch("rules.params_env.kustomize_available", return_value=True), \
+             patch("rules.params_env.kustomize_build", side_effect=tracking_build):
+            result = run(str(tmp_path), production_scope=scope)
+
+        # Probe calls use a temp copy (path contains "verify-params-env-")
+        probe_dirs = [Path(p).name for p in build_calls
+                      if "verify-params-env-" in p]
+        assert "odh" in probe_dirs
+        assert "manager" not in probe_dirs
+        assert "rhoai" not in probe_dirs
+
+    def test_no_config_scans_all_dirs(self, tmp_path):
+        """Without config, all kustomization dirs are probed (existing behavior)."""
+        self._make_repo_with_base_and_overlays(tmp_path)
+
+        hardcoded = (
+            "---\nkind: Deployment\nmetadata:\n  name: app\n"
+            "spec:\n  image: registry.io/hardcoded:v1\n"
+        )
+        scope = ProductionScope(
+            method="test",
+            manifest_source="manifests",
+        )
+
+        build_calls = []
+
+        def tracking_build(kdir):
+            build_calls.append(str(kdir))
+            return hardcoded
+
+        with patch("rules.params_env.kustomize_available", return_value=True), \
+             patch("rules.params_env.kustomize_build", side_effect=tracking_build):
+            result = run(str(tmp_path), production_scope=scope)
+
+        built_dirs = [Path(p).name for p in build_calls]
+        assert "manager" in built_dirs
+        assert "odh" in built_dirs
+
+    def test_nonexistent_overlay_in_config_skipped(self, tmp_path):
+        """Overlay dirs that don't exist are skipped gracefully."""
+        self._make_repo_with_base_and_overlays(tmp_path)
+
+        scope = ProductionScope(
+            method="test",
+            manifest_source="manifests",
+            overlay_paths=["manifests/overlays/nonexistent"],
+        )
+
+        build_calls = []
+
+        def tracking_build(kdir):
+            build_calls.append(str(kdir))
+            return "---\n"
+
+        with patch("rules.params_env.kustomize_available", return_value=True), \
+             patch("rules.params_env.kustomize_build", side_effect=tracking_build):
+            result = run(str(tmp_path), production_scope=scope)
+
+        # Probe loop should not have built the nonexistent dir.
+        # Wiring loop still runs on dirs with params.env (odh, rhoai) — that's expected.
+        built_dirs = [Path(p).name for p in build_calls]
+        assert "nonexistent" not in built_dirs
+        assert "manager" not in built_dirs
+
+
+# --- params_env_filenames config ---
+
+class TestParamsEnvFilenames:
+    """Tests for configurable env filename support."""
+
+    def _make_overlay(self, base: Path, dirname: str, fname: str, content: str) -> Path:
+        d = base / dirname
+        d.mkdir(parents=True)
+        (d / fname).write_text(content)
+        (d / "kustomization.yaml").write_text("resources: []\n")
+        return d
+
+    def test_discover_overlays_finds_extra_filename(self, tmp_path):
+        from rules.params_env_utils import discover_overlays
+        self._make_overlay(tmp_path, "overlay-latest", "params-latest.env",
+                           "IMG=quay.io/org/img:tag\n")
+        # Default (params.env only) misses it
+        assert discover_overlays(tmp_path) == []
+        # With extra filename, found
+        result = discover_overlays(tmp_path, ["params.env", "params-latest.env"])
+        assert len(result) == 1
+        assert result[0] == tmp_path / "overlay-latest"
+
+    def test_discover_overlays_deduplicates_overlay_with_both_files(self, tmp_path):
+        from rules.params_env_utils import discover_overlays
+        d = tmp_path / "overlay"
+        d.mkdir()
+        (d / "params.env").write_text("IMG=quay.io/org/img:tag\n")
+        (d / "params-latest.env").write_text("IMG_LATEST=quay.io/org/img-latest:tag\n")
+        (d / "kustomization.yaml").write_text("resources: []\n")
+        result = discover_overlays(tmp_path, ["params.env", "params-latest.env"])
+        assert result == [d]
+
+    def test_detect_params_env_finds_extra_filename_via_extra_filenames(self, tmp_path):
+        self._make_overlay(tmp_path, "overlay-latest", "params-latest.env",
+                           "IMG=quay.io/org/img@sha256:abc\n")
+        assert detect_params_env(tmp_path, extra_filenames=["params-latest.env"]) is True
+
+    def test_detect_params_env_ignores_extra_filename_without_extra_filenames(self, tmp_path):
+        self._make_overlay(tmp_path, "overlay-latest", "params-latest.env",
+                           "IMG=quay.io/org/img@sha256:abc\n")
+        assert detect_params_env(tmp_path) is False
+
+    def test_get_filenames_extends_default(self):
+        from rules.params_env import _get_filenames
+        result = _get_filenames(["params-latest.env"])
+        assert result == ["params.env", "params-latest.env"]
+
+    def test_get_filenames_no_duplicates(self):
+        from rules.params_env import _get_filenames
+        result = _get_filenames(["params.env", "params-latest.env"])
+        assert result == ["params.env", "params-latest.env"]
+
+    def test_get_filenames_empty(self):
+        from rules.params_env import _get_filenames
+        assert _get_filenames([]) == ["params.env"]
+
+    def test_find_params_env_files_with_extra_filename(self, tmp_path):
+        from rules.params_env_utils import find_params_env_files
+        d = tmp_path / "overlay"
+        d.mkdir()
+        (d / "params.env").write_text("IMG=quay.io/org/img:tag\n")
+        (d / "params-latest.env").write_text("IMG_LATEST=quay.io/org/img-latest:tag\n")
+        (d / "kustomization.yaml").write_text("resources: []\n")
+        result = find_params_env_files(d, ["params.env", "params-latest.env"])
+        names = {p.name for p in result}
+        assert names == {"params.env", "params-latest.env"}
+
+    def test_run_uses_extra_filenames_kwarg(self, tmp_path):
+        """run() reads params-latest.env when extra_filenames is passed."""
+        overlay = tmp_path / "config" / "default"
+        overlay.mkdir(parents=True)
+        (overlay / "params-latest.env").write_text(
+            "IMG_LATEST=quay.io/org/img-latest@sha256:abc\n"
+        )
+        (overlay / "kustomization.yaml").write_text("resources: []\n")
+
+        with patch("rules.params_env.kustomize_available", return_value=True), \
+             patch("rules.params_env.kustomize_build", return_value="---\n"):
+            result = run(str(tmp_path), extra_filenames=["params-latest.env"])
+
+        summary = result.findings[0].message
+        assert "1 overlay" in summary
+        assert "1 image key" in summary

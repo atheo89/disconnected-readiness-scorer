@@ -25,7 +25,7 @@ try:
         write_probe_params_env,
         extract_configmap_key_refs, extract_kustomize_replacement_keys,
         extract_env_configmap_mappings, find_go_related_image_envs,
-        PROBE_SENTINEL,
+        PROBE_SENTINEL, DEFAULT_PARAMS_ENV_FILENAMES,
     )
 except ModuleNotFoundError:
     from params_env_utils import (
@@ -35,7 +35,7 @@ except ModuleNotFoundError:
         write_probe_params_env,
         extract_configmap_key_refs, extract_kustomize_replacement_keys,
         extract_env_configmap_mappings, find_go_related_image_envs,
-        PROBE_SENTINEL,
+        PROBE_SENTINEL, DEFAULT_PARAMS_ENV_FILENAMES,
     )
 
 RULE_NAME = "params-env-wiring"
@@ -49,6 +49,17 @@ def _looks_like_image_key(key: str) -> bool:
 
 
 OPERATOR_CONFIG_FILE = "component-params-env.yaml"
+
+
+def _get_filenames(extra: list[str]) -> list[str]:
+    """Return the effective list of params.env filenames (default + extras from central config)."""
+    seen: set[str] = set(DEFAULT_PARAMS_ENV_FILENAMES)
+    result = list(DEFAULT_PARAMS_ENV_FILENAMES)
+    for f in extra:
+        if f not in seen:
+            result.append(f)
+            seen.add(f)
+    return result
 
 
 def _is_operator_repo(root: Path) -> bool:
@@ -117,6 +128,7 @@ def _process_manifest_source_folder(
     all_manifest_related_vars: set[str],
     env_mappings_set: set[str],
     overlay_dirs: list[str] | None = None,
+    filenames: list[str] | None = None,
 ) -> int:
     """Process all kustomization dirs under a manifest_source folder.
 
@@ -125,7 +137,12 @@ def _process_manifest_source_folder(
 
     Returns the number of overlays with params.env found.
     """
-    all_params_env = sorted(source_dir.rglob("params.env"))
+    if filenames is None:
+        filenames = DEFAULT_PARAMS_ENV_FILENAMES
+    all_env_files: list[Path] = []
+    for fname in filenames:
+        all_env_files.extend(source_dir.rglob(fname))
+    all_params_env = sorted(set(all_env_files))
     kustomization_files = sorted(source_dir.rglob("kustomization.yaml"))
 
     if not kustomization_files:
@@ -212,7 +229,7 @@ def _process_manifest_source_folder(
         if any(d in kustomization.parts for d in SKIP_DIRS):
             continue
 
-        dir_params_files = find_params_env_files(kdir)
+        dir_params_files = find_params_env_files(kdir, filenames)
         dir_params: dict[str, str] = {}
         for p in dir_params_files:
             dir_params.update(parse_params_env(p))
@@ -248,12 +265,15 @@ def _process_discover_overlays(
     all_repo_params: dict[str, str],
     all_manifest_related_vars: set[str],
     env_mappings_set: set[str],
+    filenames: list[str] | None = None,
 ) -> int:
     """Fallback: process overlays found by discover_overlays() (no manifest_source)."""
+    if filenames is None:
+        filenames = DEFAULT_PARAMS_ENV_FILENAMES
     total_overlays = 0
 
     for overlay_dir in overlays:
-        params_files = find_params_env_files(overlay_dir)
+        params_files = find_params_env_files(overlay_dir, filenames)
         overlay_params: dict[str, str] = {}
         image_params_files = []
         for p in params_files:
@@ -327,7 +347,8 @@ def _process_discover_overlays(
 
 
 def run(repo_root: str, manifest_env_vars: set[str] | None = None,
-        production_scope=None, **_kwargs) -> RuleResult:
+        production_scope=None, extra_filenames: list[str] | None = None,
+        **_kwargs) -> RuleResult:
     root = Path(repo_root)
     result = RuleResult(rule=RULE_NAME)
 
@@ -349,7 +370,9 @@ def run(repo_root: str, manifest_env_vars: set[str] | None = None,
     if production_scope and production_scope.overlay_paths:
         kustomize_overlay_dirs = production_scope.overlay_paths
 
-    overlays = discover_overlays(root)
+    filenames = _get_filenames(extra_filenames or [])
+
+    overlays = discover_overlays(root, filenames)
     if not overlays and not manifest_source:
         return result
 
@@ -361,7 +384,6 @@ def run(repo_root: str, manifest_env_vars: set[str] | None = None,
         ))
         return result
 
-    # No keys are ignored anymore since per-repo config is removed
     ignored_keys: set[str] = set()
 
     all_repo_params: dict[str, str] = {}
@@ -379,6 +401,7 @@ def run(repo_root: str, manifest_env_vars: set[str] | None = None,
                 all_repo_params, all_manifest_related_vars,
                 env_mappings_set,
                 overlay_dirs=kustomize_overlay_dirs,
+                filenames=filenames,
             )
     else:
         if kustomize_overlay_dirs:
@@ -388,11 +411,18 @@ def run(repo_root: str, manifest_env_vars: set[str] | None = None,
                 if any(rel == Path(d) or rel.is_relative_to(Path(d))
                        for d in kustomize_overlay_dirs):
                     filtered.append(o)
-            overlays = filtered
+            if filtered:
+                overlays = filtered
+            else:
+                for d in kustomize_overlay_dirs:
+                    entry_dir = root / d
+                    if (entry_dir / "kustomization.yaml").exists() and entry_dir not in overlays:
+                        overlays.append(entry_dir)
         total_overlays = _process_discover_overlays(
             overlays, root, ignored_keys, result,
             all_repo_params, all_manifest_related_vars,
             env_mappings_set,
+            filenames=filenames,
         )
 
     # --- Go wiring check (repo-global) ---
@@ -450,11 +480,13 @@ def run(repo_root: str, manifest_env_vars: set[str] | None = None,
     return result
 
 
-def detect_params_env(repo_root: Path) -> bool:
-    overlays = discover_overlays(repo_root)
+def detect_params_env(repo_root: Path, extra_filenames: list[str] | None = None) -> bool:
+    filenames = _get_filenames(extra_filenames or [])
+    overlays = discover_overlays(repo_root, filenames)
     for overlay_dir in overlays:
-        if parse_params_env(overlay_dir / "params.env"):
-            return True
+        for fname in filenames:
+            if parse_params_env(overlay_dir / fname):
+                return True
     return False
 
 

@@ -19,6 +19,8 @@ Today, none of these are checked automatically — failures are only discovered 
 
 ## Quick start
 
+**Prerequisites:** Install arch-analyzer first: `make install-arch-analyzer`
+
 ### As a Claude Code skill
 
 ```bash
@@ -35,6 +37,8 @@ python3 main.py /path/to/target/repo --rules csv,tags        # subset of rules
 python3 main.py /path/to/target/repo --report json           # JSON output
 python3 main.py /path/to/target/repo --operator-path /tmp/opendatahub-operator  # pre-cloned operator
 python3 main.py /path/to/target/repo --config /path/to/config.yaml              # custom central config
+python3 main.py /path/to/target/repo --arch-analyzer /path/to/arch-analyzer     # custom arch-analyzer binary
+python3 main.py /path/to/target/repo --verbose                                 # diagnostics + timing + files_checked in JSON
 ```
 
 Exit code is `0` for READY, `1` for NOT READY.
@@ -166,13 +170,21 @@ Validates Python dependencies against the known-bundled list. Packages not pre-i
 
 Parses the opendatahub-operator source to build the authoritative image manifest (100+ `RELATED_IMAGE_*` env vars across 18 components). Not run by default — included when `csv` or `params_env` detect a pattern needing cross-referencing, or when explicitly selected with `--rules manifest`.
 
-Also extracts **overlay paths** from the operator's Go source (`internal/controller/components/{component}/*_support.go`) to determine which kustomize overlays are actually deployed per platform. This allows `params-env-wiring` to scan only operator-deployed overlays, filtering out upstream overlays (e.g. `overlays/kubeflow`, `overlays/standalone`) that produce false positives.
+#### Overlay path detection via arch-analyzer
+
+[arch-analyzer](https://github.com/ugiordan/architecture-analyzer) is **required** (`make install-arch-analyzer`). The scorer runs it on the operator repo to extract `kustomize_components` data from `component-architecture.json`. This provides **overlay paths** per component — which kustomize overlays the operator actually deploys (e.g. `overlays/odh`, `overlays/rhoai`). Combined with the manifest source folder (from `get_all_manifests.sh`), this allows `params-env-wiring` to scan only operator-deployed overlays, filtering out upstream overlays (e.g. `config/runtimes`, `overlays/kubeflow`) that produce false positives.
+
+The arch-analyzer also runs on the target component repo. The resulting `component-architecture.json` is passed to rules as `arch_data` for production scope detection and overlay classification.
+
+Override overlay detection with `kustomize_overlays` in per-repo config.
 
 ### production-scope
 
-Not a rule itself, but a cross-cutting optimization for Go repos. Parses all Dockerfiles to find `go build` targets (supports multiple targets per Dockerfile), then runs `go list -deps -json` to compute the transitive dependency set. Files outside the production binary's import graph are downgraded from blocker to info. Only affects `.go` files; non-Go files use existing rule logic. Disabled with `--no-production-scope`.
+Not a rule itself, but a cross-cutting optimization. Uses arch-analyzer's `dockerfiles[].copy_instructions.original_sources` to identify production code directories. Any file under a production directory is in scope; files outside are downgraded from blocker/warning to info.
 
-When operator manifest source folder mapping is available, also scopes YAML files to the operator-referenced kustomize/helm graph. When overlay paths are auto-detected, passes them to `params-env-wiring` to restrict overlay scanning.
+Files outside production scope are downgraded from blocker to info. Applies to ALL file types (Go, Python, YAML, shell, etc) via `production_dirs` directory checks. `.yaml/.yml` files also checked against `manifest_files` set for kustomize/helm graph scoping. Disabled with `--no-production-scope`.
+
+When operator manifest source folder mapping is available, also scopes YAML files to the operator-referenced kustomize/helm graph. When overlay paths are auto-detected (or configured via `kustomize_overlays`), passes them to `params-env-wiring` to restrict overlay scanning. Uses arch-analyzer's `kustomize_overlay_refs` to classify production vs non-production overlays.
 
 ## Scoring
 
@@ -233,7 +245,8 @@ exceptions:
     reason: "Frontend services call the backend BFF, not external endpoints"
 
   - rule: "image-manifest-complete, no-image-tags"
-    path: "config/scorecard/**"
+    paths:
+      - "config/scorecard/**"
     reason: "OLM scorecard config — test images, not production"
 ```
 
@@ -247,20 +260,10 @@ All configuration is in YAML files with JSON Schema support for IDE autocomplete
 
 ### Central config (`config/config.yaml`)
 
-Single unified config in the scorer repo. Contains registries, known mirrors, and exception rules that apply to all scanned repos.
+Single unified config in the scorer repo. Contains exception rules that apply to all scanned repos.
 
 ```yaml
 # yaml-language-server: $schema=../schemas/config.schema.json
-
-registries:
-  - registry.redhat.io
-  - quay.io/opendatahub
-
-known_mirrors:
-  bundled_packages:
-    - codeflare-sdk
-  pypi_mirrors:
-    - https://pypi.corp.redhat.com/simple/
 
 exceptions:
   - rule: "*"
@@ -285,18 +288,19 @@ Exceptions are managed centrally in the scorer repository's `config/config.yaml`
 | Field       | Required | Description                                                                 |
 |-------------|----------|-----------------------------------------------------------------------------|
 | `rule`      | yes      | Rule name (e.g. `no-runtime-egress`)                                        |
-| `path`      | *        | Glob pattern matched against finding file path (e.g. `internal/client.go`)  |
+| `paths`     | *        | List of glob patterns matched against finding file path                     |
 | `image`     | *        | Glob pattern matched against finding image ref                              |
 | `message`   | *        | Glob pattern matched against finding message (use `*text*` for substring)   |
 | `reason`    | yes      | Why this is not a real disconnected issue                                   |
 | `reference` | no       | Tracking URL (GitHub Issue or Jira ticket) if this is a scanner bug         |
 
-\* At least one of `path`, `image`, or `message` is required.
+\* At least one of `paths`, `image`, or `message` is required.
 
 ```yaml
 exceptions:
   - rule: no-runtime-egress
-    path: "internal/client.go"
+    paths:
+      - "internal/client.go"
     reason: "Calls cluster-internal Kubernetes API at kubernetes.default.svc"
     # reference: "https://issues.redhat.com/browse/RHOAIENG-XXXXX"  # optional, for scanner bugs
 ```
@@ -307,11 +311,11 @@ If you think a finding is caused by a bug in the scanner (not just a repo-specif
 
 ### Common Errors
 
-**"at least one scope filter"** — Include `path`, `image`, or `message` to limit the exception. Disabling an entire rule is not allowed.
+**"at least one scope filter"** — Include `paths`, `image`, or `message` to limit the exception. Disabling an entire rule is not allowed.
 
 **"'repo' field is not allowed"** — Per-repo exceptions apply only to the current repository. Remove the `repo:` field.
 
-**"unknown field(s)"** — Check for typos in field names. Valid fields: `rule`, `path`, `image`, `message`, `reason`, `reference`.
+**"unknown field(s)"** — Check for typos in field names. Valid fields: `rule`, `paths`, `image`, `message`, `reason`, `reference`.
 
 ## PR Integration
 
@@ -448,9 +452,12 @@ Then install all dev dependencies:
 
 ```bash
 uv sync --extra dev
+make install-arch-analyzer
 ```
 
-`pyyaml` is required. `jinja2` is optional at runtime (report rendering degrades gracefully) but required for full test coverage.
+**Required:** `pyyaml`, `arch-analyzer` (for production scope detection, overlay classification, and operator analysis).
+
+**Optional:** `jinja2` (report rendering degrades gracefully without it, installed with `--extra report` or `--extra dev`).
 
 ### Running tests
 

@@ -16,8 +16,8 @@ from typing import Dict, List, Optional, Set, Tuple
 
 
 PROBE_SENTINEL = "probe.test/verify-params-env:check"
-IMAGE_PLACEHOLDERS = frozenset({"REPLACE_IMAGE"})
 SKIP_DIRS = {".git", "vendor", "node_modules", "__pycache__"}
+DEFAULT_PARAMS_ENV_FILENAMES: List[str] = ["params.env"]
 
 _IMAGE_RE = re.compile(
     r"[a-zA-Z0-9._-]+/[a-zA-Z0-9._/-]+(?::[a-zA-Z0-9._-]+|@sha256:[a-f0-9]+)"
@@ -116,22 +116,35 @@ def parse_params_env(params_path: Path) -> Dict[str, str]:
     return entries
 
 
-def find_params_env_files(overlay_dir: Path) -> List[Path]:
+def find_params_env_files(
+    overlay_dir: Path,
+    filenames: Optional[List[str]] = None,
+) -> List[Path]:
+    if filenames is None:
+        filenames = DEFAULT_PARAMS_ENV_FILENAMES
     params_files: List[Path] = []
     visited: Set[Path] = set()
-    _collect_params_env(overlay_dir, params_files, visited)
+    _collect_params_env(overlay_dir, params_files, visited, filenames)
     return params_files
 
 
-def _collect_params_env(overlay_dir: Path, result: List[Path], visited: Set[Path]):
+def _collect_params_env(
+    overlay_dir: Path,
+    result: List[Path],
+    visited: Set[Path],
+    filenames: Optional[List[str]] = None,
+):
+    if filenames is None:
+        filenames = DEFAULT_PARAMS_ENV_FILENAMES
     resolved = overlay_dir.resolve()
     if resolved in visited:
         return
     visited.add(resolved)
 
-    params = overlay_dir / "params.env"
-    if params.exists():
-        result.append(params)
+    for fname in filenames:
+        p = overlay_dir / fname
+        if p.exists():
+            result.append(p)
 
     kustomization = overlay_dir / "kustomization.yaml"
     if not kustomization.exists():
@@ -150,18 +163,30 @@ def _collect_params_env(overlay_dir: Path, result: List[Path], visited: Set[Path
                     continue
                 parent = (overlay_dir / ref).resolve()
                 if parent.is_dir():
-                    _collect_params_env(parent, result, visited)
+                    _collect_params_env(parent, result, visited, filenames)
             elif stripped and not stripped.startswith("#"):
                 in_resources = False
 
 
-def discover_overlays(repo_root: Path) -> List[Path]:
-    overlays = []
-    for params_env in sorted(repo_root.rglob("params.env")):
+def discover_overlays(
+    repo_root: Path,
+    filenames: Optional[List[str]] = None,
+) -> List[Path]:
+    if filenames is None:
+        filenames = DEFAULT_PARAMS_ENV_FILENAMES
+    seen_overlays: Set[Path] = set()
+    overlays: List[Path] = []
+    all_env_files: List[Path] = []
+    for fname in filenames:
+        all_env_files.extend(repo_root.rglob(fname))
+    for params_env in sorted(set(all_env_files)):
         if any(d in params_env.parts for d in SKIP_DIRS):
             continue
         overlay_dir = params_env.parent
+        if overlay_dir in seen_overlays:
+            continue
         if (overlay_dir / "kustomization.yaml").exists():
+            seen_overlays.add(overlay_dir)
             overlays.append(overlay_dir)
     return overlays
 
@@ -245,22 +270,44 @@ def extract_all_images(rendered: str, exclude_patterns: List[str]) -> Dict[str, 
                 break
         resource_id = f"{kind}/{name}" if kind and name else kind or "unknown"
 
-        for m in _IMAGE_RE.findall(doc):
-            if m in IMAGE_PLACEHOLDERS:
+        # For ConfigMaps, track which data key each line belongs to so the
+        # location string can include [key=<name>] for precise exception matching.
+        cm_data_key: Optional[str] = None
+        in_data_section = False
+        lines = doc.splitlines()
+        for i, line in enumerate(lines):
+            if line == "data:":
+                in_data_section = True
+                cm_data_key = None
                 continue
-            if any(fnmatch.fnmatch(m, pat) for pat in exclude_patterns):
-                continue
-            images.setdefault(m, [])
-            if resource_id not in images[m]:
-                images[m].append(resource_id)
-        for m in _UNQUALIFIED_IMAGE_RE.findall(doc):
-            if m in IMAGE_PLACEHOLDERS:
-                continue
-            if any(fnmatch.fnmatch(m, pat) for pat in exclude_patterns):
-                continue
-            images.setdefault(m, [])
-            if resource_id not in images[m]:
-                images[m].append(resource_id)
+            if in_data_section:
+                # A top-level data key is indented by exactly 2 spaces.
+                data_key_match = re.match(r"^  ([^: ][^:]*):", line)
+                if data_key_match:
+                    cm_data_key = data_key_match.group(1)
+                elif line and not line.startswith(" "):
+                    # Left the data section.
+                    in_data_section = False
+                    cm_data_key = None
+
+            loc = (
+                f"{resource_id}{{key:{cm_data_key}}}"
+                if kind == "ConfigMap" and cm_data_key
+                else resource_id
+            )
+
+            for m in _IMAGE_RE.findall(line):
+                if any(fnmatch.fnmatch(m, pat) for pat in exclude_patterns):
+                    continue
+                images.setdefault(m, [])
+                if loc not in images[m]:
+                    images[m].append(loc)
+            for m in _UNQUALIFIED_IMAGE_RE.findall(line):
+                if any(fnmatch.fnmatch(m, pat) for pat in exclude_patterns):
+                    continue
+                images.setdefault(m, [])
+                if loc not in images[m]:
+                    images[m].append(loc)
     return images
 
 

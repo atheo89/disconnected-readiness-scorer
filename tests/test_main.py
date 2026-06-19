@@ -60,7 +60,12 @@ class TestParseArgs:
 
     def test_output_short(self):
         args = parse_args([".", "-o", "out.md"])
-        assert args.output == "out.md"
+        assert args.output == ["out.md"]
+
+    def test_output_dual(self):
+        args = parse_args([".", "--report", "json,markdown", "-o", "r.json", "r.md"])
+        assert args.report == "json,markdown"
+        assert args.output == ["r.json", "r.md"]
 
 
 # --- resolve_rules ---
@@ -222,6 +227,25 @@ class TestRenderJson:
         data = json.loads(render_json("READY", [], "repo"))
         assert data["rules"] == []
         assert data["score"] == "READY"
+
+    def test_verbose_includes_files_checked(self):
+        r = RuleResult(rule="b", passed=True)
+        r.files_checked = ["src/a.go", "src/b.go", "src/a.go"]
+        data = json.loads(render_json("READY", [r], "repo", verbose=True))
+        rule = data["rules"][0]
+        assert "files_checked" in rule
+        assert rule["files_checked"] == ["src/a.go", "src/b.go"]  # sorted+deduped
+
+    def test_non_verbose_omits_files_checked(self):
+        r = RuleResult(rule="b", passed=True)
+        r.files_checked = ["src/a.go"]
+        data = json.loads(render_json("READY", [r], "repo", verbose=False))
+        assert "files_checked" not in data["rules"][0]
+
+    def test_verbose_omits_files_checked_when_empty(self):
+        r = RuleResult(rule="c", passed=True)
+        data = json.loads(render_json("READY", [r], "repo", verbose=True))
+        assert "files_checked" not in data["rules"][0]
 
 
 # --- _render_template_simple ---
@@ -501,7 +525,7 @@ class TestApplyExceptions:
                 Finding("blocker", "deploy/app.yaml", 2, "img2", "also bad"),
             ],
         )]
-        exceptions = [{"rule": "no-image-tags", "path": "src/*.go", "reason": "source ok"}]
+        exceptions = [{"rule": "no-image-tags", "paths": ["src/*.go"], "reason": "source ok"}]
         apply_exceptions(results, exceptions, "repo")
         assert results[0].findings[0].severity == "info"
         assert results[0].findings[1].severity == "blocker"
@@ -678,6 +702,58 @@ class TestParseArgsExceptions:
 # --- central exception loading ---
 
 
+class TestLoadCentralConfig:
+    def test_missing_file_returns_defaults(self, tmp_path):
+        from main import load_central_config
+        cfg = load_central_config(str(tmp_path / "nope.yaml"))
+        assert cfg["exceptions"] == []
+
+    def test_present_file_has_all_keys(self, tmp_path):
+        from main import load_central_config
+        f = tmp_path / "config.yaml"
+        f.write_text("exceptions: []\n")
+        cfg = load_central_config(str(f))
+        assert cfg["docker_contexts"] == {}
+        assert cfg["known_non_image_prefixes"] == []
+        assert cfg["params_env_filenames"] == {}
+
+    def test_loads_docker_contexts(self, tmp_path):
+        from main import load_central_config
+        f = tmp_path / "config.yaml"
+        f.write_text(
+            "docker_contexts:\n"
+            "  myrepo:\n"
+            "    Dockerfile: src/\n"
+        )
+        cfg = load_central_config(str(f))
+        assert cfg["docker_contexts"] == {"myrepo": {"Dockerfile": "src/"}}
+
+    def test_loads_known_non_image_prefixes(self, tmp_path):
+        from main import load_central_config
+        f = tmp_path / "config.yaml"
+        f.write_text("known_non_image_prefixes:\n  - ghcr.io/foo/bar\n")
+        cfg = load_central_config(str(f))
+        assert "ghcr.io/foo/bar" in cfg["known_non_image_prefixes"]
+
+    def test_loads_params_env_filenames(self, tmp_path):
+        from main import load_central_config
+        f = tmp_path / "config.yaml"
+        f.write_text(
+            "params_env_filenames:\n"
+            "  myrepo:\n"
+            "    - params-latest.env\n"
+        )
+        cfg = load_central_config(str(f))
+        assert cfg["params_env_filenames"] == {"myrepo": ["params-latest.env"]}
+
+
+class TestArchAnalyzerError:
+    def test_is_exception(self):
+        from main import ArchAnalyzerError
+        err = ArchAnalyzerError("binary missing")
+        assert isinstance(err, Exception)
+        assert "binary missing" in str(err)
+
 
 # --- exception snippets and false positive section ---
 
@@ -685,7 +761,7 @@ class TestExceptionSnippets:
     def test_builds_snippets_from_blockers_only(self):
         results = [RuleResult(rule="no-image-tags", findings=[
             Finding("blocker", "deploy.yaml", 10, "img:latest", "mutable tag"),
-            Finding("warning", "src/main.go", 5, "img:v1", "source tag"),
+            Finding("info", "src/main.go", 5, "img:v1", "source tag"),
             Finding("info", "test/t.go", 1, "img:dev", "test file"),
         ])]
         snippets = _build_exception_snippets(results)

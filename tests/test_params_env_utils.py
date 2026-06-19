@@ -37,6 +37,30 @@ class TestExtractAllImages:
         result = extract_all_images(rendered, [])
         assert result.get("quay.io/org/img:v1") == ["Deployment/myapp"]
 
+    def test_configmap_data_key_in_location(self):
+        rendered = (
+            "---\nkind: ConfigMap\nmetadata:\n  name: inferenceservice-config\n"
+            "data:\n"
+            "  _example: |-\n"
+            "    image: kserve/storage-initializer:latest\n"
+            "  storageInitializer: |-\n"
+            "    image: quay.io/org/real:v1\n"
+        )
+        result = extract_all_images(rendered, [])
+        locs_example = result.get("kserve/storage-initializer:latest", [])
+        assert any("{key:_example}" in loc for loc in locs_example)
+        locs_real = result.get("quay.io/org/real:v1", [])
+        assert any("{key:storageInitializer}" in loc for loc in locs_real)
+
+    def test_non_configmap_has_no_key_suffix(self):
+        rendered = (
+            "---\nkind: Deployment\nmetadata:\n  name: myapp\n"
+            "data:\n  somekey: quay.io/org/img:v1\n"
+        )
+        result = extract_all_images(rendered, [])
+        locs = result.get("quay.io/org/img:v1", [])
+        assert all("[key=" not in loc for loc in locs)
+
 
 class TestExtractConfigmapKeyRefs:
     def test_finds_key_refs(self):

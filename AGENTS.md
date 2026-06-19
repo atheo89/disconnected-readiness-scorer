@@ -38,6 +38,7 @@ python3 main.py /path/to/target/repo                     # all default rules
 python3 main.py . --rules csv,tags                        # subset of rules
 python3 main.py . --report json                           # JSON output
 python3 main.py . --operator-path /tmp/opendatahub-operator  # pre-cloned operator
+python3 main.py . --verbose                               # diagnostics + timing + files_checked in JSON
 ```
 
 Rule aliases: `csv`, `tags`, `egress`, `python`, `params_env`, `manifest`. Exit code is 0 for READY, 1 for NOT READY.
@@ -58,9 +59,9 @@ All rules output JSON to stdout with `rule`, `passed`, and `findings` fields.
 
 ## Architecture
 
-**Orchestrator (`main.py`):** CLI entry point that imports rules as modules, runs them, computes the aggregate score, and renders output (console summary + markdown or JSON report). Handles the operator manifest lifecycle — only clones when `csv` or `params_env` detect a pattern needing cross-referencing, or when `manifest` is explicitly selected. Supports `--exceptions` to load exception rules that downgrade matching findings to info severity. Computes production scope once via `production_scope.compute_production_scope()` and passes it to all rules. Use `--no-production-scope` to disable.
+**Orchestrator (`main.py`):** CLI entry point that imports rules as modules, runs them, computes the aggregate score, and renders output (console summary + markdown or JSON report). Handles the operator manifest lifecycle — only clones when `csv` or `params_env` detect a pattern needing cross-referencing, or when `manifest` is explicitly selected. Supports `--exceptions` to load exception rules that downgrade matching findings to info severity. Computes production scope once via `production_scope.compute_production_scope()` and passes it to all rules. Use `--no-production-scope` to disable. Supports `--verbose` / `-v` for detailed diagnostic output (per-step timing, file scan progress, config loading, production scope decisions). When combined with `--report json`, includes `files_checked` per rule in the JSON output. `ArchAnalyzerError` is raised when the arch-analyzer binary is missing or fails, caught in `main()` for clean error reporting.
 
-**Shared types (`rules/common.py`):** `Finding`, `RuleResult`, and `ProductionScope` dataclasses used by all rules, plus `get_tracked_files()` and `is_in_production_scope()`. Each rule uses a dual-import pattern: `try: from rules.common import ...` / `except ModuleNotFoundError: from common import ...` so standalone execution (`python3 rules/foo.py .`) works without the package being installed. The catch is deliberately narrow (`ModuleNotFoundError` only, not `ImportError`) to avoid masking other import errors such as misspelled symbols or circular imports. Tests import via the package path (`from rules.common import ...`).
+**Shared types (`rules/common.py`):** `Finding`, `RuleResult`, `ProductionScope`, `Severity` enum, and `ConfigError` exception used by all rules, plus `get_tracked_files()`, `is_file_in_production_scope()`, `is_yaml_in_production_scope()`, and `is_non_production_overlay_file()`. The `Severity` enum (`blocker`/`info`) validates severity strings at `Finding` construction time via `__post_init__` — invalid severities raise `ValueError`. `ConfigError` is raised when a config file exists but cannot be read or parsed (replaces previous silent `{}` return). Each rule uses a dual-import pattern: `try: from rules.common import ...` / `except ModuleNotFoundError: from common import ...` so standalone execution (`python3 rules/foo.py .`) works without the package being installed. The catch is deliberately narrow (`ModuleNotFoundError` only, not `ImportError`) to avoid masking other import errors such as misspelled symbols or circular imports. Tests import via the package path (`from rules.common import ...`).
 
 **Rule engine pattern:** Every rule module under `rules/` exports a `run(repo_root) -> RuleResult` function. `RuleResult` is a dataclass with `rule` (name), `passed` (bool), and `findings` (list of `Finding`). Each `Finding` has `severity` (blocker/info), `file`, `line`, `image`, and `message`. Severity is binary: blocker (will/may break disconnected) or info (excluded file, configurable pattern, or informational).
 
@@ -76,11 +77,11 @@ All rules output JSON to stdout with `rule`, `passed`, and `findings` fields.
 
 **Manifest cross-referencing:** When the orchestrator runs, it detects the target repo's image pattern. If env_var or params_env, it clones the opendatahub-operator, builds the authoritative manifest via `operator_manifest.build_manifest()`, and passes the env var set to `image_manifest_complete.run()`. For env_var: (A) image ref uses a RELATED_IMAGE var not in the manifest → blocker, (B) repo defines a var not in the manifest → blocker, (C) manifest vars not referenced in repo → info. For params_env: validates that RELATED_IMAGE vars mapped from params.env keys exist in the operator manifest.
 
-**Production scope (`rules/production_scope.py`):** Reduces false positives for Go repos by narrowing scanning to files that compile into the production binary. Parses Dockerfiles to find `go build` targets, falls back to `cmd/*/main.go` heuristic. Runs `go list -deps -json` to compute the transitive dependency set. Returns a `ProductionScope` with the set of production `.go` files. Rules downgrade out-of-scope `.go` file findings from blocker/warning to info. Returns `None` (full scan) for non-Go repos, missing Go toolchain, or build errors. Only affects `.go` files; non-Go files use existing rule logic.
+**Production scope (`rules/production_scope.py`):** Reduces false positives by narrowing scanning to production source directories. Uses arch-analyzer's `dockerfiles[].copy_instructions[].original_sources` to identify which directories are COPYed into Docker images. Returns a `ProductionScope` with `production_dirs` (set of resolved directory paths). Rules downgrade findings from files outside `production_dirs` from blocker/warning to info. Applies to ALL file types (Go, Python, YAML, shell, etc). Returns `None` (full scan) when arch_data has no original_sources.
 
 **Exclusion logic:** Test-path exclusion is handled centrally by `config/config.yaml`, not by individual rules. The exceptions mechanism downgrades matching blocker findings to info severity based on file path globs, covering test directories, CI config, build files, and lint rules. Rules emit findings at their natural severity; the orchestrator applies exceptions post-hoc.
 
-**Central config (`config/config.yaml`):** Single unified YAML with `registries`, `known_mirrors` (bundled packages + PyPI mirrors), and `exceptions` (central exception rules). Loaded by the orchestrator via `--exceptions` or defaults to `config/config.yaml`. JSON schema at `schemas/config.schema.json`.
+**Central config (`config/config.yaml`):** Single unified YAML with exception rules that apply to all scanned repos. Loaded by the orchestrator via `--exceptions` or defaults to `config/config.yaml`. JSON schema at `schemas/config.schema.json`.
 
 **Configuration:** All configuration is managed centrally through `config/config.yaml`. No per-repository configuration files are supported. All exceptions and settings are managed through the central configuration file.
 
@@ -88,10 +89,10 @@ All rules output JSON to stdout with `rule`, `passed`, and `findings` fields.
 
 ## Severity Levels
 
-| Severity | Meaning |
-|----------|---------|
-| blocker | Will or may break disconnected — must be fixed or granted an exception |
-| info | Excluded file, configurable pattern, or informational — does not block |
+| Severity | Meaning                                                                    |
+|----------|----------------------------------------------------------------------------|
+| blocker  | Will or may break disconnected — must be fixed or granted an exception     |
+| info     | Excluded file, configurable pattern, or informational — does not block     |
 
 ## Post-Change Checklist
 

@@ -40,7 +40,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          cd scorer && uv sync --extra report --frozen
+          cd scorer && uv sync --extra report --frozen && make install-arch-analyzer
 
       - name: Run disconnected readiness check
         env:

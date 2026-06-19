@@ -25,6 +25,13 @@ Scans a repository for common patterns that break disconnected deployments:
 
 All rules exclude test files (`*_test.go`, `test/`, `testdata/`), CI config (`.github/`, `.tekton/`), and linting rules (`semgrep.yaml`) from blocker-level findings.
 
+## Prerequisites
+
+- Python 3.12+
+- arch-analyzer binary (install with `make install-arch-analyzer` in the repo root)
+
+The scorer uses arch-analyzer to extract production code scope and kustomize overlay mappings. This replaces fragile Dockerfile parsing and provides accurate production vs non-production file classification.
+
 ## Usage
 
 ```bash
@@ -47,24 +54,23 @@ Then from the root of any RHOAI component repo:
 
 ## Output
 
-```
-Disconnected Readiness Score: WARNING
+```text
+Disconnected Readiness Score: NOT READY
 
-  BLOCKER  csv-relatedimages    2 images in code missing from CSV relatedImages
-  PASS     no-image-tags        All 14 image references use digests
-  WARNING  no-runtime-egress    1 HTTP call in pkg/controller/sync.go:142 — verify it uses mirror config
-  PASS     python-imports       No unbundled Python dependencies found
+  FAIL     image-manifest-complete   2 blocker(s)
+  PASS     no-image-tags             All checks passed
+  PASS     no-runtime-egress         All checks passed
+  PASS     python-imports-bundled    All checks passed
 
-Blockers: 1 | Warnings: 1 | Passed: 2
+Blockers: 2 | Passed: 3
 ```
 
 ### Score levels
 
-| Score | Meaning |
-|-------|---------|
-| **READY** | All rules pass |
-| **WARNING** | No blockers, but warnings need review |
-| **NOT READY** | One or more blocker-level failures |
+| Score         | Meaning                              |
+|---------------|--------------------------------------|
+| **READY**     | All rules pass — no blocker findings |
+| **NOT READY** | One or more blocker-level findings   |
 
 ## Rules
 
@@ -92,7 +98,7 @@ Scans Go, Python, and TypeScript source for patterns indicating outbound network
 - TypeScript: `fetch(`, `axios`, `http.request`
 - Shell: `curl`, `wget` in scripts executed at runtime
 
-Build-time usage (Dockerfiles, Makefiles, CI scripts) is excluded. Runtime usage where the URL is configurable/mirrorable is a **warning**; hardcoded external URLs are a **blocker**.
+Build-time usage (Dockerfiles, Makefiles, CI scripts) is excluded. Runtime usage where the URL is configurable/mirrorable is **info**; hardcoded external URLs are a **blocker**.
 
 ### python-imports-bundled
 
@@ -106,31 +112,34 @@ Unbundled runtime dependencies: **blocker**. Unbundled dev/test dependencies: **
 
 ## Configuration
 
-### config/known_mirrors.yaml
+### Central config (`config/config.yaml`)
 
-Lists approved internal registries and PyPI mirrors. The scanner treats any image pull or pip install targeting these as safe.
-
-```yaml
-registries:
-  - registry.redhat.io
-  - brew.registry.redhat.io
-  - quay.io/opendatahub
-  - quay.io/modh
-
-pypi_mirrors:
-  - https://pypi.corp.redhat.com/simple/
-```
-
-### config/exceptions.yaml
-
-Per-repo rule exceptions for known false positives.
+Exception rules applied to all scanned repos.
 
 ```yaml
 exceptions:
-  - repo: opendatahub-io/odh-dashboard
-    rule: no-runtime-egress
-    path: frontend/src/utilities/fetch.ts
+  - rule: "*"
+    paths:
+      - "**/test/**"
+    reason: "Test directory — not deployed in production"
+
+  - rule: no-runtime-egress
+    repo: opendatahub-io/odh-dashboard
+    paths:
+      - "frontend/src/utilities/fetch.ts"
     reason: "Uses cluster-internal API proxy, not external egress"
+```
+
+### Per-repo config (`.disconnected-readiness/config.yaml`)
+
+Optional config in the target repo for repo-specific exclusions.
+
+```yaml
+exceptions:
+  - rule: no-runtime-egress
+    paths:
+      - "internal/client.go"
+    reason: "Calls cluster-internal Kubernetes API"
 ```
 
 ## Integration

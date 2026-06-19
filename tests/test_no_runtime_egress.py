@@ -161,20 +161,21 @@ class TestRun:
         assert result.findings[0].severity == "info"
         assert "no hardcoded URL" in result.findings[0].message
 
-    def test_production_scope_downgrades_blocker(self, tmp_path):
+    def test_production_scope_skips_out_of_scope(self, tmp_path):
         pkg = tmp_path / "pkg"
         pkg.mkdir()
         f = pkg / "client.go"
         f.write_text('resp, err := http.Get("https://api.external.com/data")')
-        other = tmp_path / "main.go"
+        cmd = tmp_path / "cmd"
+        cmd.mkdir()
+        other = cmd / "main.go"
         other.write_text("package main\n")
         scope = ProductionScope(
-            production_files={other.resolve()}, method="go-import-graph",
+            production_dirs={cmd.resolve()}, method="go-import-graph",
         )
         result = run(str(tmp_path), production_scope=scope)
         assert result.passed is True
-        assert result.findings[0].severity == "info"
-        assert "[out of production scope]" in result.findings[0].message
+        assert len(result.findings) == 0
 
     def test_production_scope_keeps_in_scope_blocker(self, tmp_path):
         pkg = tmp_path / "pkg"
@@ -182,7 +183,7 @@ class TestRun:
         f = pkg / "client.go"
         f.write_text('resp, err := http.Get("https://api.external.com/data")')
         scope = ProductionScope(
-            production_files={f.resolve()},
+            production_dirs={f.parent.resolve()},
             method="go-import-graph",
         )
         result = run(str(tmp_path), production_scope=scope)
@@ -201,7 +202,7 @@ class TestRun:
     def test_production_scope_ignores_non_go(self, tmp_path):
         f = tmp_path / "fetch.py"
         f.write_text('requests.get("https://example.com/api")')
-        scope = ProductionScope(production_files=set(), method="go-import-graph")
+        scope = ProductionScope(method="go-import-graph")
         result = run(str(tmp_path), production_scope=scope)
         assert result.findings[0].severity == "blocker"
 
