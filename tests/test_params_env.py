@@ -293,6 +293,41 @@ class TestManifestSourceFlow:
         blockers = [f for f in result.findings if f.severity == "blocker"]
         assert not any("Hardcoded image" in f.message for f in blockers)
 
+    def test_probe_replaces_params_latest_env_images(self, tmp_path):
+        """Images in params-latest.env should be probed and not flagged as hardcoded."""
+        self._make_manifest_source(tmp_path, {
+            "base": {
+                "kustomization": "resources: []\n",
+                "extra_files": {
+                    "params-latest.env": "LATEST=quay.io/opendatahub/notebook:v1\n",
+                },
+            },
+        })
+        scope = ProductionScope(
+            production_files=set(), method="test",
+            manifest_source="manifests",
+        )
+
+        def fake_kustomize_build(overlay_dir):
+            image = (Path(overlay_dir) / "params-latest.env").read_text().split("=", 1)[1].strip()
+            return (
+                "---\nkind: ImageStream\nmetadata:\n  name: nb\n"
+                f"spec:\n  tags:\n  - from:\n      name: {image}\n"
+            )
+
+        with patch("rules.params_env.kustomize_available", return_value=True), \
+             patch("rules.params_env.kustomize_build", side_effect=fake_kustomize_build):
+            result = run(
+                str(tmp_path),
+                production_scope=scope,
+                extra_filenames=["params-latest.env"],
+            )
+
+        assert not any(
+            f.severity == "blocker" and "Hardcoded image" in f.message
+            for f in result.findings
+        )
+
     def test_no_params_env_flags_all_images(self, tmp_path):
         """Kustomize dirs without params.env: all images are hardcoded."""
         manifest_dir = self._make_manifest_source(tmp_path, {
